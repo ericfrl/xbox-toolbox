@@ -36,12 +36,19 @@ import os
 import time
 import threading
 import json
-import ctypes
 import re
 import serial
 import serial.tools.list_ports
 import tkinter as tk
 from tkinter import ttk, messagebox
+
+# Import modular components
+from FRL_robot_controller import RobotController
+from FRL_xbox_controller import XboxController
+
+# Import from shared location
+sys.path.insert(0, os.path.expanduser('~/.frl'))
+from FRL_tube_feeder import TubeFeederController
 
 # =============================================================================
 # CONFIGURATION
@@ -59,488 +66,6 @@ FRL_FEEDER_PORT = "/dev/frl_feeder"
 DEFAULT_SPEED = 25
 DEFAULT_ACCEL = 10
 DEFAULT_DECEL = 10
-
-# =============================================================================
-# TUBE FEEDER CONTROLLER (imported from ~/.frl/FRL_tube_feeder.py)
-# =============================================================================
-
-# Import from shared location
-sys.path.insert(0, os.path.expanduser('~/.frl'))
-from FRL_tube_feeder import TubeFeederController
-
-
-# =============================================================================
-# ROBOT CONTROLLER
-# =============================================================================
-
-class RobotController:
-    """Controller for AR4 robot via serial."""
-
-    def __init__(self, name="Robot", port=None, baudrate=115200):
-        self.name = name
-        self.port = port
-        self.baudrate = baudrate
-        self.serial = None
-        self.connected = False
-        self.reading = False
-        self.read_thread = None
-
-        # Current position (from encoder feedback)
-        self.joints = [0.0] * 6  # J1-J6
-        self.j7_pos = 0.0  # Linear track
-        self.cartesian = [0.0] * 6  # X, Y, Z, Rx, Ry, Rz
-
-        # Jogging state
-        self.jogging = False
-        self.last_response = ""
-
-    def find_teensy(self, exclude_ports=None):
-        """Auto-detect Teensy port for AR4."""
-        exclude = exclude_ports or []
-        ports = serial.tools.list_ports.comports()
-        for port in ports:
-            if port.device in exclude:
-                continue
-            desc = port.description.lower() if port.description else ''
-            if 'teensy' in desc:
-                return port.device
-        return None
-
-    def connect(self):
-        """Connect to the robot."""
-        if self.port is None:
-            return False
-        try:
-            self.serial = serial.Serial(self.port, self.baudrate, timeout=0.1)
-            time.sleep(0.5)
-            self.serial.reset_input_buffer()
-            self.connected = True
-            self.reading = True
-            self.read_thread = threading.Thread(target=self._read_loop, daemon=True)
-            self.read_thread.start()
-            return True
-        except serial.SerialException as e:
-            print(f"[{self.name}] Connection error: {e}")
-            return False
-
-    def disconnect(self):
-        """Disconnect from robot."""
-        self.reading = False
-        self.stop_jog()
-        if self.serial and self.serial.is_open:
-            self.serial.close()
-        self.connected = False
-
-    def _read_loop(self):
-        """Background thread to read serial responses."""
-        while self.reading and self.serial and self.serial.is_open:
-            try:
-                if self.serial.in_waiting:
-                    line = self.serial.readline().decode('utf-8', errors='ignore').strip()
-                    if line:
-                        self.last_response = line
-                        self._parse_response(line)
-            except:
-                pass
-            time.sleep(0.005)
-
-    def _parse_response(self, line):
-        """Parse position feedback from robot."""
-        # AR4 sends position data in format: A1.23B4.56C... etc.
-        # Example: A10.50B-5.25C30.00D0.00E45.00F-90.00J100.00
-        try:
-            if line.startswith("A") and "B" in line:
-                # Parse joint angles from response
-                # Match pattern like A10.50B-5.25C30.00D0.00E45.00F-90.00J100.00
-                pattern = r'A([-\d.]+)B([-\d.]+)C([-\d.]+)D([-\d.]+)E([-\d.]+)F([-\d.]+)'
-                match = re.search(pattern, line)
-                if match:
-                    self.joints = [float(match.group(i)) for i in range(1, 7)]
-
-                # Also parse J7 if present
-                j7_match = re.search(r'J([-\d.]+)', line)
-                if j7_match:
-                    self.j7_pos = float(j7_match.group(1))
-
-            elif line.startswith("X") and "Y" in line:
-                # Parse Cartesian position: X100.0Y200.0Z300.0Rx0.0Ry0.0Rz0.0
-                pattern = r'X([-\d.]+)Y([-\d.]+)Z([-\d.]+)'
-                match = re.search(pattern, line)
-                if match:
-                    self.cartesian[0] = float(match.group(1))
-                    self.cartesian[1] = float(match.group(2))
-                    self.cartesian[2] = float(match.group(3))
-
-                rx_match = re.search(r'Rx([-\d.]+)', line)
-                ry_match = re.search(r'Ry([-\d.]+)', line)
-                rz_match = re.search(r'Rz([-\d.]+)', line)
-                if rx_match:
-                    self.cartesian[3] = float(rx_match.group(1))
-                if ry_match:
-                    self.cartesian[4] = float(ry_match.group(1))
-                if rz_match:
-                    self.cartesian[5] = float(rz_match.group(1))
-        except Exception:
-            pass
-
-    def send(self, command):
-        """Send a command to the robot."""
-        if not self.connected:
-            return False
-        try:
-            cmd = command if command.endswith('\n') else command + '\n'
-            self.serial.write(cmd.encode())
-            self.serial.flush()
-            return True
-        except:
-            return False
-
-    def stop_jog(self):
-        """Stop all jogging motion."""
-        self.jogging = False
-        return self.send("S")
-
-    def jog_joint(self, joint, direction, speed=25, accel=10, decel=10):
-        """
-        Start live jogging a joint.
-        joint: 1-6 for main joints, 7 for linear track
-        direction: +1 or -1
-        speed: 1-100 (will be scaled to robot's range: 1-25)
-        """
-        # Scale 1-100% to robot range 1-25
-        robot_speed = max(1, int(speed * 25 / 100))
-        # Live jog command format: LJ + joint code
-        # Code: J1- = 10, J1+ = 11, J2- = 20, J2+ = 21, etc.
-        code = joint * 10 + (1 if direction > 0 else 0)
-        self.jogging = True
-        return self.send(f"LJ{code}S{robot_speed}A{accel}D{decel}")
-
-    def jog_cartesian(self, axis, direction, speed=25, accel=10, decel=10):
-        """
-        Start live jogging in Cartesian space.
-        axis: 'X', 'Y', 'Z', 'Rx', 'Ry', 'Rz'
-        direction: +1 or -1
-        speed: 1-100 (will be scaled to robot's range: 1-25)
-        """
-        # Scale 1-100% to robot range 1-25
-        robot_speed = max(1, int(speed * 25 / 100))
-        axis_map = {'X': 1, 'Y': 2, 'Z': 3, 'Rx': 4, 'Ry': 5, 'Rz': 6}
-        if axis not in axis_map:
-            return False
-        code = axis_map[axis] * 10 + (1 if direction > 0 else 0)
-        self.jogging = True
-        return self.send(f"LC{code}S{robot_speed}A{accel}D{decel}")
-
-    def jog_j7(self, direction, speed=25, accel=10, decel=10):
-        """Jog linear track (J7)."""
-        # Scale 1-100% to robot range 1-25
-        robot_speed = max(1, int(speed * 25 / 100))
-        code = 70 + (1 if direction > 0 else 0)
-        self.jogging = True
-        return self.send(f"LJ{code}S{robot_speed}A{accel}D{decel}")
-
-    def emergency_stop(self):
-        """Emergency stop."""
-        self.jogging = False
-        return self.send("ES")
-
-    def get_position(self):
-        """Request current position."""
-        return self.send("GP")
-
-
-# =============================================================================
-# XBOX CONTROLLER (Cross-platform)
-# =============================================================================
-
-class XboxController:
-    """Cross-platform Xbox controller interface."""
-
-    # Button constants
-    BTN_A = 'A'
-    BTN_B = 'B'
-    BTN_X = 'X'
-    BTN_Y = 'Y'
-    BTN_LB = 'LB'
-    BTN_RB = 'RB'
-    BTN_BACK = 'BACK'
-    BTN_START = 'START'
-    DPAD_UP = 'DPAD_UP'
-    DPAD_DOWN = 'DPAD_DOWN'
-    DPAD_LEFT = 'DPAD_LEFT'
-    DPAD_RIGHT = 'DPAD_RIGHT'
-
-    def __init__(self):
-        self.connected = False
-        self.platform = sys.platform
-        self._xinput = None
-        self._controller_idx = None
-
-        # Current state
-        self.buttons = set()
-        self.prev_buttons = set()
-        self.left_stick = (0.0, 0.0)
-        self.right_stick = (0.0, 0.0)
-        self.left_trigger = 0.0
-        self.right_trigger = 0.0
-
-        # Callbacks
-        self.on_button_press = None
-        self.on_button_release = None
-        self.on_stick_move = None
-        self.on_trigger = None
-
-        # Deadzone
-        self.deadzone = 0.15
-
-        # Polling thread
-        self._polling = False
-        self._poll_thread = None
-
-    def connect(self):
-        """Initialize controller connection."""
-        if self.platform == 'win32':
-            return self._connect_windows()
-        else:
-            return self._connect_linux()
-
-    def _connect_windows(self):
-        """Connect using Windows XInput."""
-        try:
-            for dll in ["xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll"]:
-                try:
-                    self._xinput = ctypes.WinDLL(dll)
-                    break
-                except OSError:
-                    continue
-
-            if self._xinput is None:
-                return False
-
-            # Define structures
-            class XINPUT_GAMEPAD(ctypes.Structure):
-                _fields_ = [
-                    ("wButtons", ctypes.c_ushort),
-                    ("bLeftTrigger", ctypes.c_ubyte),
-                    ("bRightTrigger", ctypes.c_ubyte),
-                    ("sThumbLX", ctypes.c_short),
-                    ("sThumbLY", ctypes.c_short),
-                    ("sThumbRX", ctypes.c_short),
-                    ("sThumbRY", ctypes.c_short),
-                ]
-
-            class XINPUT_STATE(ctypes.Structure):
-                _fields_ = [
-                    ("dwPacketNumber", ctypes.c_uint),
-                    ("Gamepad", XINPUT_GAMEPAD)
-                ]
-
-            self._XINPUT_STATE = XINPUT_STATE
-            self._xinput.XInputGetState.argtypes = [ctypes.c_uint, ctypes.POINTER(XINPUT_STATE)]
-            self._xinput.XInputGetState.restype = ctypes.c_uint
-
-            # Find controller
-            state = XINPUT_STATE()
-            for i in range(4):
-                if self._xinput.XInputGetState(i, ctypes.byref(state)) == 0:
-                    self._controller_idx = i
-                    self.connected = True
-                    return True
-            return False
-
-        except Exception as e:
-            print(f"XInput error: {e}")
-            return False
-
-    def _connect_linux(self):
-        """Connect using inputs library on Linux."""
-        try:
-            from inputs import devices
-            if devices.gamepads:
-                self.connected = True
-                return True
-            return False
-        except ImportError:
-            print("Install 'inputs' package: pip install inputs")
-            return False
-        except Exception:
-            return False
-
-    def start_polling(self):
-        """Start background polling thread."""
-        if not self.connected:
-            return False
-        self._polling = True
-        self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
-        self._poll_thread.start()
-        return True
-
-    def stop_polling(self):
-        """Stop polling thread."""
-        self._polling = False
-
-    def _poll_loop(self):
-        """Main polling loop."""
-        if self.platform == 'win32':
-            self._poll_windows()
-        else:
-            self._poll_linux()
-
-    def _poll_windows(self):
-        """Windows XInput polling."""
-        # Button masks
-        BTN_MASKS = {
-            0x1000: self.BTN_A,
-            0x2000: self.BTN_B,
-            0x4000: self.BTN_X,
-            0x8000: self.BTN_Y,
-            0x0100: self.BTN_LB,
-            0x0200: self.BTN_RB,
-            0x0020: self.BTN_BACK,
-            0x0010: self.BTN_START,
-            0x0001: self.DPAD_UP,
-            0x0002: self.DPAD_DOWN,
-            0x0004: self.DPAD_LEFT,
-            0x0008: self.DPAD_RIGHT,
-        }
-
-        while self._polling:
-            state = self._XINPUT_STATE()
-            if self._xinput.XInputGetState(self._controller_idx, ctypes.byref(state)) != 0:
-                self.connected = False
-                time.sleep(0.5)
-                continue
-
-            gp = state.Gamepad
-
-            # Parse buttons
-            new_buttons = set()
-            for mask, name in BTN_MASKS.items():
-                if gp.wButtons & mask:
-                    new_buttons.add(name)
-
-            # Detect presses and releases
-            pressed = new_buttons - self.prev_buttons
-            released = self.prev_buttons - new_buttons
-
-            for btn in pressed:
-                if self.on_button_press:
-                    self.on_button_press(btn)
-
-            for btn in released:
-                if self.on_button_release:
-                    self.on_button_release(btn)
-
-            self.prev_buttons = self.buttons
-            self.buttons = new_buttons
-
-            # Parse sticks (normalize to -1.0 to 1.0)
-            def normalize(val, deadzone=8000):
-                if abs(val) < deadzone:
-                    return 0.0
-                return max(-1.0, min(1.0, val / 32767.0))
-
-            self.left_stick = (normalize(gp.sThumbLX), normalize(gp.sThumbLY))
-            self.right_stick = (normalize(gp.sThumbRX), normalize(gp.sThumbRY))
-
-            if self.on_stick_move:
-                self.on_stick_move(self.left_stick, self.right_stick)
-
-            # Parse triggers (0-255 to 0.0-1.0)
-            self.left_trigger = gp.bLeftTrigger / 255.0
-            self.right_trigger = gp.bRightTrigger / 255.0
-
-            if self.on_trigger:
-                self.on_trigger(self.left_trigger, self.right_trigger)
-
-            time.sleep(0.008)  # ~120Hz
-
-    def _poll_linux(self):
-        """Linux inputs library polling."""
-        try:
-            from inputs import get_gamepad
-
-            # Event code mappings
-            BTN_MAP = {
-                'BTN_SOUTH': self.BTN_A,
-                'BTN_EAST': self.BTN_B,
-                'BTN_WEST': self.BTN_X,
-                'BTN_NORTH': self.BTN_Y,
-                'BTN_TL': self.BTN_LB,
-                'BTN_TR': self.BTN_RB,
-                'BTN_SELECT': self.BTN_BACK,
-                'BTN_START': self.BTN_START,
-            }
-
-            while self._polling:
-                try:
-                    events = get_gamepad()
-                    for event in events:
-                        # Buttons
-                        if event.code in BTN_MAP:
-                            btn = BTN_MAP[event.code]
-                            if event.state == 1:
-                                self.buttons.add(btn)
-                                if self.on_button_press:
-                                    self.on_button_press(btn)
-                            else:
-                                self.buttons.discard(btn)
-                                if self.on_button_release:
-                                    self.on_button_release(btn)
-
-                        # D-pad
-                        elif event.code == 'ABS_HAT0X':
-                            self.buttons.discard(self.DPAD_LEFT)
-                            self.buttons.discard(self.DPAD_RIGHT)
-                            if event.state == -1:
-                                self.buttons.add(self.DPAD_LEFT)
-                                if self.on_button_press:
-                                    self.on_button_press(self.DPAD_LEFT)
-                            elif event.state == 1:
-                                self.buttons.add(self.DPAD_RIGHT)
-                                if self.on_button_press:
-                                    self.on_button_press(self.DPAD_RIGHT)
-
-                        elif event.code == 'ABS_HAT0Y':
-                            self.buttons.discard(self.DPAD_UP)
-                            self.buttons.discard(self.DPAD_DOWN)
-                            if event.state == -1:
-                                self.buttons.add(self.DPAD_UP)
-                                if self.on_button_press:
-                                    self.on_button_press(self.DPAD_UP)
-                            elif event.state == 1:
-                                self.buttons.add(self.DPAD_DOWN)
-                                if self.on_button_press:
-                                    self.on_button_press(self.DPAD_DOWN)
-
-                        # Left stick
-                        elif event.code == 'ABS_X':
-                            self.left_stick = (event.state / 32767.0, self.left_stick[1])
-                        elif event.code == 'ABS_Y':
-                            self.left_stick = (self.left_stick[0], -event.state / 32767.0)
-
-                        # Right stick
-                        elif event.code == 'ABS_RX':
-                            self.right_stick = (event.state / 32767.0, self.right_stick[1])
-                        elif event.code == 'ABS_RY':
-                            self.right_stick = (self.right_stick[0], -event.state / 32767.0)
-
-                        # Triggers (Xbox Series uses 0-1023, older uses 0-255)
-                        elif event.code == 'ABS_Z':
-                            self.left_trigger = min(1.0, event.state / 1023.0)
-                        elif event.code == 'ABS_RZ':
-                            self.right_trigger = min(1.0, event.state / 1023.0)
-
-                        if self.on_stick_move:
-                            self.on_stick_move(self.left_stick, self.right_stick)
-                        if self.on_trigger:
-                            self.on_trigger(self.left_trigger, self.right_trigger)
-
-                except Exception as e:
-                    time.sleep(0.1)
-
-        except Exception as e:
-            print(f"Linux gamepad error: {e}")
 
 
 # =============================================================================
@@ -573,7 +98,12 @@ class XboxToolbox:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("Xbox Toolbox - FRL Multi-Robot Control")
+        # Set title based on theme (so user can tell which version)
+        theme_mode = getattr(root, '_theme_mode', 'cyber')
+        if theme_mode == 'darkly':
+            self.root.title("Xbox Toolbox - Dashboard Mode")
+        else:
+            self.root.title("Xbox Toolbox - FRL Multi-Robot Control")
         self.root.resizable(True, True)
 
         # Load saved geometry or use default
@@ -695,27 +225,114 @@ class XboxToolbox:
         self._save_config()
 
     def _build_gui(self):
-        """Build the Tkinter GUI with dark cyber theme."""
-        # === DARK THEME COLORS ===
-        self.colors = {
-            'bg_dark': '#1a1a2e',
-            'bg_mid': '#16213e',
-            'bg_light': '#0f3460',
-            'accent': '#e94560',
-            'accent2': '#00d9ff',
-            'success': '#00ff88',
-            'warning': '#ffaa00',
-            'text': '#ffffff',
-            'text_dim': '#888899',
-            'border': '#0f3460'
-        }
+        """Build the Tkinter GUI with theme support."""
+        # Detect theme mode
+        self.theme_mode = getattr(self.root, '_theme_mode', 'cyber')
+
+        # === THEME COLORS ===
+        if self.theme_mode == 'cyborg':
+            # ttkbootstrap cyborg theme - black with vibrant multi-color accents
+            self.colors = {
+                'bg_dark': '#060606',
+                'bg_mid': '#1a1a1a',
+                'bg_light': '#2d2d2d',
+                'accent': '#ff3366',    # hot pink for title
+                'accent2': '#00ffcc',   # cyan/teal
+                'accent3': '#bf5fff',   # purple/violet
+                'accent4': '#ffff00',   # yellow
+                'success': '#39ff14',   # neon green
+                'warning': '#ff8800',   # orange
+                'danger': '#ff2222',    # red for E-STOP
+                'robot1': '#00aaff',    # blue for robot 1
+                'robot2': '#ff66aa',    # pink for robot 2
+                'feeder': '#ffcc00',    # gold for feeder
+                'text': '#ffffff',
+                'text_dim': '#888888',
+                'border': '#404040'
+            }
+        elif self.theme_mode == 'darkly':
+            # ttkbootstrap darkly theme colors
+            self.colors = {
+                'bg_dark': '#222222',
+                'bg_mid': '#303030',
+                'bg_light': '#444444',
+                'accent': '#375a7f',    # darkly primary
+                'accent2': '#00bc8c',   # darkly success
+                'success': '#00bc8c',
+                'warning': '#f39c12',
+                'text': '#ffffff',
+                'text_dim': '#adb5bd',
+                'border': '#444444'
+            }
+        elif self.theme_mode == 'superhero':
+            # ttkbootstrap superhero - dark blue/orange
+            self.colors = {
+                'bg_dark': '#2b3e50',
+                'bg_mid': '#3a5068',
+                'bg_light': '#4e6680',
+                'accent': '#df691a',    # superhero primary (orange)
+                'accent2': '#5cb85c',   # superhero success
+                'success': '#5cb85c',
+                'warning': '#f0ad4e',
+                'text': '#ffffff',
+                'text_dim': '#8a9dae',
+                'border': '#4e6680'
+            }
+        elif self.theme_mode == 'vapor':
+            # ttkbootstrap vapor - purple/pink
+            self.colors = {
+                'bg_dark': '#1a1a2e',
+                'bg_mid': '#2d2d44',
+                'bg_light': '#3f3f5a',
+                'accent': '#ea39b8',    # vapor primary (pink)
+                'accent2': '#3cf281',   # vapor success (neon green)
+                'success': '#3cf281',
+                'warning': '#ffe700',
+                'text': '#ffffff',
+                'text_dim': '#8a8aa3',
+                'border': '#3f3f5a'
+            }
+        elif self.theme_mode == 'solar':
+            # ttkbootstrap solar - dark blue/yellow
+            self.colors = {
+                'bg_dark': '#002b36',
+                'bg_mid': '#073642',
+                'bg_light': '#094959',
+                'accent': '#b58900',    # solar primary (yellow)
+                'accent2': '#2aa198',   # solar success (cyan)
+                'success': '#2aa198',
+                'warning': '#cb4b16',
+                'text': '#ffffff',
+                'text_dim': '#839496',
+                'border': '#094959'
+            }
+        else:
+            # Custom cyber theme (default) - black background with colorful accents
+            self.colors = {
+                'bg_dark': '#0a0a0a',
+                'bg_mid': '#1a1a1a',
+                'bg_light': '#2a2a2a',
+                'accent': '#ff3366',       # hot pink
+                'accent2': '#00ffcc',      # cyan
+                'accent3': '#bf5fff',      # purple
+                'success': '#39ff14',      # neon green
+                'warning': '#ff8800',      # orange
+                'danger': '#cc0000',       # red
+                'robot1': '#00aaff',       # blue
+                'robot2': '#ff66aa',       # pink
+                'feeder': '#ffcc00',       # gold
+                'text': '#ffffff',
+                'text_dim': '#888899',
+                'border': '#333333'
+            }
 
         # Configure root window
         self.root.configure(bg=self.colors['bg_dark'])
 
         # Style configuration
         style = ttk.Style()
-        style.theme_use('clam')
+        if self.theme_mode != 'darkly':
+            style.theme_use('clam')
 
         # Configure dark theme styles
         style.configure("Dark.TFrame", background=self.colors['bg_dark'])
@@ -770,6 +387,16 @@ class XboxToolbox:
                             command=self._show_help)
         help_btn.pack(side=tk.RIGHT, padx=5)
 
+        # Restart button
+        restart_btn = tk.Button(header_frame, text="↻",
+                               font=("Consolas", 14, "bold"),
+                               bg=self.colors['bg_light'], fg=self.colors['warning'],
+                               activebackground=self.colors['warning'],
+                               activeforeground=self.colors['bg_dark'],
+                               relief=tk.FLAT, cursor='hand2', width=3,
+                               command=self._restart)
+        restart_btn.pack(side=tk.RIGHT, padx=5)
+
         # === STATUS BAR (Top) ===
         status_bar = tk.Frame(main_frame, bg=self.colors['bg_mid'], height=50)
         status_bar.pack(fill=tk.X, pady=(0, 10))
@@ -782,7 +409,7 @@ class XboxToolbox:
         self._create_led_indicator(status_bar, "FEED", 3)
 
         # === ACTIVE MODE DISPLAY ===
-        mode_display = tk.Frame(main_frame, bg=self.colors['bg_mid'], height=100)
+        mode_display = tk.Frame(main_frame, bg=self.colors['bg_mid'], height=120)
         mode_display.pack(fill=tk.X, pady=5)
         mode_display.pack_propagate(False)
 
@@ -792,7 +419,7 @@ class XboxToolbox:
 
         self.mode_label = tk.Label(mode_top, text="◉ ROBOT 1",
                                    font=("Consolas", 22, "bold"),
-                                   fg=self.colors['accent2'], bg=self.colors['bg_mid'])
+                                   fg=self.colors.get('robot1', self.colors['accent2']), bg=self.colors['bg_mid'])
         self.mode_label.pack(side=tk.LEFT, padx=20)
 
         # Train/Move toggle button
@@ -882,23 +509,26 @@ class XboxToolbox:
         conn_frame = tk.Frame(main_frame, bg=self.colors['bg_dark'])
         conn_frame.pack(fill=tk.X, pady=10)
 
-        # Robot 1
-        r1_panel = self._create_connection_panel(conn_frame, "ROBOT 1", 0)
+        # Robot 1 (blue)
+        r1_color = self.colors.get('robot1', self.colors['accent2'])
+        r1_panel = self._create_connection_panel(conn_frame, "ROBOT 1", 0, r1_color)
         self.r1_port_var = r1_panel['port_var']
         self.r1_port_combo = r1_panel['combo']
         self.r1_status_led = r1_panel['led']
         r1_panel['button'].configure(command=self._connect_robot1)
         r1_panel['refresh'].configure(command=self._refresh_ports)
 
-        # Robot 2
-        r2_panel = self._create_connection_panel(conn_frame, "ROBOT 2", 1)
+        # Robot 2 (pink)
+        r2_color = self.colors.get('robot2', self.colors['accent2'])
+        r2_panel = self._create_connection_panel(conn_frame, "ROBOT 2", 1, r2_color)
         self.r2_port_var = r2_panel['port_var']
         self.r2_port_combo = r2_panel['combo']
         self.r2_status_led = r2_panel['led']
         r2_panel['button'].configure(command=self._connect_robot2)
 
-        # Tube Feeder
-        j9_panel = self._create_connection_panel(conn_frame, "TUBE FEEDER", 2)
+        # Tube Feeder (gold)
+        feeder_color = self.colors.get('feeder', self.colors['accent2'])
+        j9_panel = self._create_connection_panel(conn_frame, "TUBE FEEDER", 2, feeder_color)
         self.feeder_port_var = j9_panel['port_var']
         self.feeder_port_combo = j9_panel['combo']
         self.feeder_status_led = j9_panel['led']
@@ -997,7 +627,7 @@ class XboxToolbox:
 
         # === EMERGENCY STOP ===
         estop_btn = tk.Button(main_frame, text="⚠ EMERGENCY STOP ALL ⚠",
-                             bg=self.colors['accent'], fg='white',
+                             bg='#cc0000', fg='white',
                              font=("Consolas", 14, "bold"),
                              activebackground='#ff0000', activeforeground='white',
                              relief=tk.FLAT, cursor='hand2', height=2,
@@ -1047,9 +677,9 @@ class XboxToolbox:
 
         # === XBOX CONNECT BUTTON ===
         xbox_btn = tk.Button(main_frame, text="🎮 CONNECT XBOX CONTROLLER",
-                            bg=self.colors['bg_light'], fg=self.colors['accent2'],
+                            bg=self.colors['bg_light'], fg=self.colors['success'],
                             font=("Consolas", 11, "bold"),
-                            activebackground=self.colors['accent2'],
+                            activebackground=self.colors['success'],
                             activeforeground=self.colors['bg_dark'],
                             relief=tk.FLAT, cursor='hand2',
                             command=self._connect_xbox)
@@ -1119,11 +749,15 @@ class XboxToolbox:
         elif label == "FEED":
             self.feeder_led = led
 
-    def _create_connection_panel(self, parent, title, col):
+    def _create_connection_panel(self, parent, title, col, title_color=None):
         """Create a connection panel for a device."""
         panel = tk.Frame(parent, bg=self.colors['bg_light'], padx=10, pady=8)
         panel.grid(row=0, column=col, padx=5, sticky='ew')
         parent.columnconfigure(col, weight=1)
+
+        # Use device-specific color or fallback
+        if title_color is None:
+            title_color = self.colors['accent2']
 
         # Title with LED
         title_frame = tk.Frame(panel, bg=self.colors['bg_light'])
@@ -1134,7 +768,7 @@ class XboxToolbox:
         led.pack(side=tk.LEFT, padx=(0, 5))
 
         tk.Label(title_frame, text=title, font=("Consolas", 10, "bold"),
-                fg=self.colors['accent2'], bg=self.colors['bg_light']).pack(side=tk.LEFT)
+                fg=title_color, bg=self.colors['bg_light']).pack(side=tk.LEFT)
 
         # Port selection
         port_var = tk.StringVar()
@@ -1333,7 +967,12 @@ class XboxToolbox:
         """Cycle through device modes (R1 -> R2 -> Both)."""
         self.device_mode = (self.device_mode + 1) % 3
         mode_icons = ["◉ ROBOT 1", "◉ ROBOT 2", "◉◉ BOTH ROBOTS"]
-        self.mode_label.config(text=mode_icons[self.device_mode])
+        mode_colors = [
+            self.colors.get('robot1', self.colors['accent2']),
+            self.colors.get('robot2', self.colors['accent2']),
+            self.colors.get('accent3', self.colors['accent2'])  # purple for both
+        ]
+        self.mode_label.config(text=mode_icons[self.device_mode], fg=mode_colors[self.device_mode])
         self._log(f"Switched to: {self.MODE_NAMES[self.device_mode]}")
 
         # Stop any current jogging when switching
@@ -1444,11 +1083,9 @@ class XboxToolbox:
         max_val = max(abs(lx), abs(ly), abs(rx), abs(ry))
 
         if max_val < dz:
-            # No significant input - stop jogging
-            if self.current_jog is not None and self.current_jog[0] in ('J', 'C'):
-                # Only stop if it was a stick-initiated jog (not button)
-                if self.current_jog[1] in (1, 2, 3, 4, 'X', 'Y', 'Z', 'Rz'):
-                    self._stop_all_jog()
+            # No significant input - ALWAYS stop jogging for safety
+            if self.current_jog is not None:
+                self._stop_all_jog()
             return
 
         # Update action display to show stick input (for debugging)
@@ -1845,6 +1482,7 @@ Sticks not responding:
             if self.robot1.connected:
                 waypoint['r1'] = {
                     'joints': list(self.robot1.joints),
+                    'cartesian': list(self.robot1.cartesian),
                     'j7': self.robot1.j7_pos
                 }
 
@@ -1852,6 +1490,7 @@ Sticks not responding:
             if self.robot2.connected:
                 waypoint['r2'] = {
                     'joints': list(self.robot2.joints),
+                    'cartesian': list(self.robot2.cartesian),
                     'j7': self.robot2.j7_pos
                 }
 
@@ -1862,7 +1501,19 @@ Sticks not responding:
         self.pathway['waypoints'].append(waypoint)
         count = len(self.pathway['waypoints'])
         self.waypoint_count_label.config(text=f"Waypoints: {count}")
-        self._log(f"Added waypoint #{count}")
+
+        # Debug: show what was captured
+        if waypoint.get('r1'):
+            j = waypoint['r1']['joints']
+            c = waypoint['r1']['cartesian']
+            self._log(f"WP#{count} R1 joints: [{j[0]:.1f},{j[1]:.1f},{j[2]:.1f},{j[3]:.1f},{j[4]:.1f},{j[5]:.1f}]")
+            self._log(f"WP#{count} R1 cart: X={c[0]:.1f} Y={c[1]:.1f} Z={c[2]:.1f}")
+        if waypoint.get('r2'):
+            j = waypoint['r2']['joints']
+            c = waypoint['r2']['cartesian']
+            self._log(f"WP#{count} R2 joints: [{j[0]:.1f},{j[1]:.1f},{j[2]:.1f},{j[3]:.1f},{j[4]:.1f},{j[5]:.1f}]")
+            self._log(f"WP#{count} R2 cart: X={c[0]:.1f} Y={c[1]:.1f} Z={c[2]:.1f}")
+
         self.action_label.config(text=f"Waypoint #{count} added", fg=self.colors['success'])
 
     def _delete_last_waypoint(self):
@@ -2007,13 +1658,13 @@ Sticks not responding:
                 self.root.after(0, lambda idx=i: self.playback_label.config(
                     text=f"▶ {idx+1}/{len(self.pathway['waypoints'])}"))
 
-                # Move robot(s) to waypoint
-                self._move_to_waypoint(waypoint)
+                # Move robot(s) to waypoint and wait for completion
+                success = self._move_to_waypoint(waypoint)
 
-                # Wait for motion to complete (simplified - uses delay based on speed)
-                # Lower speed = longer delay
-                delay = max(0.5, 3.0 - (self.speed / 50.0))
-                time.sleep(delay)
+                if not success:
+                    self.root.after(0, lambda: self._log("Move failed - stopping playback"))
+                    self.root.after(0, self._stop_playback)
+                    return
 
                 if not self.playback_active:
                     return
@@ -2024,31 +1675,80 @@ Sticks not responding:
                 return
 
     def _move_to_waypoint(self, waypoint):
-        """Move robot(s) to a waypoint position."""
+        """
+        Move robot(s) to a waypoint position and wait for completion.
+
+        Returns:
+            True if all moves completed successfully, False otherwise
+        """
         # Scale speed 1-100% to robot range 1-25
         robot_speed = max(1, int(self.speed * 25 / 100))
         accel, decel = self._get_accel_decel()
 
-        # Move Robot 1
+        success = True
+
+        # Move Robot 1 and wait for completion
         if waypoint.get('r1') and self.robot1.connected:
-            joints = waypoint['r1']['joints']
-            j7 = waypoint['r1'].get('j7', 0.0)
-            # AR4 move joint command format (no spaces)
-            cmd = f"MJA{joints[0]:.3f}B{joints[1]:.3f}C{joints[2]:.3f}"
-            cmd += f"D{joints[3]:.3f}E{joints[4]:.3f}F{joints[5]:.3f}"
-            cmd += f"J{j7:.3f}S{robot_speed}A{accel}D{decel}"
-            self.robot1.send(cmd)
+            r1_data = waypoint['r1']
 
-        # Move Robot 2
+            # Use Cartesian if available, otherwise fall back to joints
+            if 'cartesian' in r1_data and any(r1_data['cartesian']):
+                cart = r1_data['cartesian']
+                # MJ command with Cartesian (matches FRL.py format)
+                cmd = f"MJX{cart[0]:.3f}Y{cart[1]:.3f}Z{cart[2]:.3f}"
+                cmd += f"Rz{cart[5]:.3f}Ry{cart[4]:.3f}Rx{cart[3]:.3f}"
+                cmd += f"Sp{robot_speed}Ac{accel}Dc{decel}Rm100W0Lm000000"
+            else:
+                # Fallback: try joint command (may not work)
+                joints = r1_data['joints']
+                cmd = f"MJ{joints[0]:.3f}A{joints[1]:.3f}B{joints[2]:.3f}"
+                cmd += f"C{joints[3]:.3f}D{joints[4]:.3f}E{joints[5]:.3f}"
+                cmd += f"F{robot_speed}G{accel}H{decel}"
+
+            self.root.after(0, lambda c=cmd: self._log(f"R1: {c[:60]}..."))
+
+            ok, response = self.robot1.move_and_wait(cmd)
+            if ok:
+                self.root.after(0, lambda: self._log("R1: Complete"))
+            else:
+                self.root.after(0, lambda r=response: self._log(f"R1 Error: {r}"))
+                success = False
+        elif waypoint.get('r1'):
+            self.root.after(0, lambda: self._log("R1: NOT CONNECTED"))
+
+        # Check if still playing before Robot 2
+        if not self.playback_active:
+            return False
+
+        # Move Robot 2 and wait for completion
         if waypoint.get('r2') and self.robot2.connected:
-            joints = waypoint['r2']['joints']
-            j7 = waypoint['r2'].get('j7', 0.0)
-            cmd = f"MJA{joints[0]:.3f}B{joints[1]:.3f}C{joints[2]:.3f}"
-            cmd += f"D{joints[3]:.3f}E{joints[4]:.3f}F{joints[5]:.3f}"
-            cmd += f"J{j7:.3f}S{robot_speed}A{accel}D{decel}"
-            self.robot2.send(cmd)
+            r2_data = waypoint['r2']
 
-        # Move feeder
+            # Use Cartesian if available, otherwise fall back to joints
+            if 'cartesian' in r2_data and any(r2_data['cartesian']):
+                cart = r2_data['cartesian']
+                # MJ command with Cartesian (matches FRL.py format)
+                cmd = f"MJX{cart[0]:.3f}Y{cart[1]:.3f}Z{cart[2]:.3f}"
+                cmd += f"Rz{cart[5]:.3f}Ry{cart[4]:.3f}Rx{cart[3]:.3f}"
+                cmd += f"Sp{robot_speed}Ac{accel}Dc{decel}Rm100W0Lm000000"
+            else:
+                joints = r2_data['joints']
+                cmd = f"MJ{joints[0]:.3f}A{joints[1]:.3f}B{joints[2]:.3f}"
+                cmd += f"C{joints[3]:.3f}D{joints[4]:.3f}E{joints[5]:.3f}"
+                cmd += f"F{robot_speed}G{accel}H{decel}"
+
+            self.root.after(0, lambda c=cmd: self._log(f"R2: {c[:60]}..."))
+
+            ok, response = self.robot2.move_and_wait(cmd)
+            if ok:
+                self.root.after(0, lambda: self._log("R2: Complete"))
+            else:
+                self.root.after(0, lambda r=response: self._log(f"R2 Error: {r}"))
+                success = False
+        elif waypoint.get('r2'):
+            self.root.after(0, lambda: self._log("R2: NOT CONNECTED"))
+
+        # Move feeder (no wait - it's fast)
         feeder_pos = waypoint.get('feeder', 0.0)
         if self.feeder.connected and feeder_pos != self.feeder.position:
             delta = feeder_pos - self.feeder.position
@@ -2056,6 +1756,8 @@ Sticks not responding:
                 self.feeder.feed(abs(delta))
             else:
                 self.feeder.retract(abs(delta))
+
+        return success
 
     def _update_status(self):
         """Periodic status update with LED indicators."""
@@ -2070,6 +1772,19 @@ Sticks not responding:
 
         # Schedule next update
         self.root.after(500, self._update_status)
+
+    def _restart(self):
+        """Restart the application with same arguments."""
+        import subprocess
+        self._log("Restarting...")
+        self._save_geometry()
+        self.xbox.stop_polling()
+        self.robot1.disconnect()
+        self.robot2.disconnect()
+        self.feeder.disconnect()
+        # Relaunch with same arguments
+        subprocess.Popen([sys.executable] + sys.argv, start_new_session=True)
+        self.root.destroy()
 
     def on_close(self):
         """Clean up on window close."""
@@ -2106,10 +1821,31 @@ def kill_previous_instances():
 
 
 def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Xbox Toolbox for AR4 Multi-Robot Control')
+    parser.add_argument('--theme', type=str, default='cyber',
+                        choices=['cyber', 'darkly', 'cyborg', 'superhero', 'vapor', 'solar'],
+                        help='UI theme: cyber (default custom) or ttkbootstrap themes')
+    args = parser.parse_args()
+
     # Kill any previous instances first
     kill_previous_instances()
 
-    root = tk.Tk()
+    # Create root window based on theme
+    if args.theme != 'cyber':
+        try:
+            import ttkbootstrap as ttkb
+            root = ttkb.Window(themename=args.theme)
+            root._theme_mode = args.theme
+        except ImportError:
+            print("Warning: ttkbootstrap not installed, falling back to cyber theme")
+            root = tk.Tk()
+            root._theme_mode = 'cyber'
+    else:
+        root = tk.Tk()
+        root._theme_mode = 'cyber'
+
     app = XboxToolbox(root)
     root.protocol("WM_DELETE_WINDOW", app.on_close)
     root.mainloop()
