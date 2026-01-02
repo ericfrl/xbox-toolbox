@@ -1,8 +1,8 @@
 # Xbox Toolbox
 
-**AR4 Multi-Robot Control via Xbox Controller**
+**FRL Multi-Robot Control via Xbox Controller**
 
-A standalone tool for controlling multiple AR4 robots, linear tracks (J7), and tube feeders (J9) using an Xbox controller. Features a dark cyberpunk-themed GUI with LED status indicators.
+A standalone tool for controlling multiple FRL robots, linear tracks (J7), and tube feeders (J9) using an Xbox controller. Features a dark cyberpunk-themed GUI with LED status indicators and pathway training/playback.
 
 ![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)
 ![Platform](https://img.shields.io/badge/Platform-Linux-green.svg)
@@ -12,14 +12,31 @@ A standalone tool for controlling multiple AR4 robots, linear tracks (J7), and t
 
 - **Multi-Robot Control**: Switch between Robot 1, Robot 2, or control both simultaneously
 - **Xbox Controller Support**: Full gamepad integration with analog sticks, triggers, and buttons
+- **Train/Move Modes**: Record waypoints and playback pathways for automated motion
 - **Linear Track (J7)**: Control external linear axis via X/Y buttons
 - **Tube Feeder (J9)**: Arduino-controlled tube feeding system via LB/RB bumpers
 - **Joint & Cartesian Modes**: Toggle between joint-space and Cartesian jogging
+- **Pathway Persistence**: Save/load pathways as JSON files for reuse
 - **Dark Cyber Theme**: Modern GUI with LED indicators and visual feedback
 - **Auto-Save Window Position**: Remembers window size and location
 - **Auto-Kill Previous Instances**: Only one instance runs at a time
 
+## Operation Modes
+
+### Move Mode (Default)
+Standard jogging mode for manual robot control.
+
+### Train Mode
+Record waypoints to create automated pathways:
+1. Click the **MOVE** button to switch to **TRAIN** mode
+2. Use sticks/d-pad to position the robot
+3. Press **A** to add a waypoint at current position
+4. Repeat to build a pathway
+5. Press **Start** or click **Play** to execute the pathway
+
 ## Button Mapping
+
+### Move Mode (Default)
 
 | Button | Function |
 |--------|----------|
@@ -36,6 +53,30 @@ A standalone tool for controlling multiple AR4 robots, linear tracks (J7), and t
 | **RB** | J9 Tube Feeder Feed |
 | **LT** | Decrease Speed |
 | **RT** | Increase Speed |
+
+### Train Mode
+
+| Button | Function |
+|--------|----------|
+| **A** | Add Waypoint |
+| **B** | Delete Last Waypoint |
+| **Start** | Toggle Playback |
+| **Back** | Cycle Robot: R1 → R2 → Both |
+| **Sticks/D-pad** | Position robot (same as Move mode) |
+| **X/Y** | J7 Track (same as Move mode) |
+| **LB/RB** | Tube Feeder (same as Move mode) |
+| **LT/RT** | Adjust Speed (same as Move mode) |
+
+## Pathway Panel (Train Mode)
+
+When in Train mode, a pathway panel appears with:
+- **Waypoint Counter**: Shows number of recorded waypoints
+- **Name Field**: Enter a name for the pathway
+- **Save**: Save pathway to `~/.xbox_toolbox_pathways/`
+- **Load**: Load a previously saved pathway
+- **Clear**: Delete all waypoints from current pathway
+- **Loop**: Toggle continuous playback
+- **Play/Stop**: Start or stop pathway execution
 
 ## Installation
 
@@ -162,11 +203,30 @@ xbox-toolbox/
 
 MIT License - See LICENSE file for details.
 
+## Pathway Data Format
+
+Pathways are saved as JSON files in `~/.xbox_toolbox_pathways/`:
+
+```json
+{
+  "name": "pathway_1",
+  "robot_mode": "both",
+  "created": "2025-12-31T12:00:00",
+  "waypoints": [
+    {
+      "r1": {"joints": [0.0, -15.0, 30.0, 0.0, 45.0, 0.0], "j7": 100.0},
+      "r2": {"joints": [0.0, -15.0, 30.0, 0.0, 45.0, 0.0], "j7": 50.0},
+      "feeder": 25.5
+    }
+  ]
+}
+```
+
 ## Related Projects
 
-- [AR4 Robot Arm](https://github.com/SkyentificGit/AR4) - Original AR4 project
 - [Tube Feeder](../tube_feeder/) - Arduino tube feeder controller
+- [Heartbeat](../Heartbeat/) - FRL System Monitor Dashboard
 
 ---
 
-Built for AR4 dual-robot systems with Xbox controller integration.
+Built for FRL dual-robot systems with Xbox controller integration.

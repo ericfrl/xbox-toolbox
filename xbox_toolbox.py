@@ -37,6 +37,7 @@ import time
 import threading
 import json
 import ctypes
+import re
 import serial
 import serial.tools.list_ports
 import tkinter as tk
@@ -49,10 +50,10 @@ from tkinter import ttk, messagebox
 DEFAULT_BAUDRATE = 115200
 FEEDER_BAUDRATE = 115200
 
-# Default COM ports (will be auto-detected or user-selected)
-ROBOT1_PORT = None
-ROBOT2_PORT = None
-FEEDER_PORT = None
+# Default ports - use udev symlinks when available
+FRL_ROBOT1_PORT = "/dev/frl_robot1"
+FRL_ROBOT2_PORT = "/dev/frl_robot2"
+FRL_FEEDER_PORT = "/dev/frl_feeder"
 
 # Jogging parameters
 DEFAULT_SPEED = 25
@@ -60,117 +61,12 @@ DEFAULT_ACCEL = 10
 DEFAULT_DECEL = 10
 
 # =============================================================================
-# TUBE FEEDER CONTROLLER (from tube_feeder/feeder_test.py)
+# TUBE FEEDER CONTROLLER (imported from ~/.frl/FRL_tube_feeder.py)
 # =============================================================================
 
-class TubeFeederController:
-    """Controller for Arduino-based tube feeder."""
-
-    def __init__(self, port=None, baudrate=115200):
-        self.port = port
-        self.baudrate = baudrate
-        self.serial = None
-        self.connected = False
-        self.reading = False
-        self.read_thread = None
-        self.position = 0.0
-        self.last_response = ""
-
-    def find_arduino(self):
-        """Auto-detect Arduino Uno port."""
-        ports = serial.tools.list_ports.comports()
-        for port in ports:
-            desc = port.description.lower() if port.description else ''
-            if 'arduino' in desc and 'uno' in desc:
-                return port.device
-        for port in ports:
-            desc = port.description.lower() if port.description else ''
-            if 'arduino' in desc and 'teensy' not in desc:
-                return port.device
-        for port in ports:
-            if port.vid == 0x2341:  # Arduino vendor ID
-                if port.pid in [0x0043, 0x0001, 0x0243]:
-                    return port.device
-        return None
-
-    def connect(self):
-        """Connect to the Arduino."""
-        if self.port is None:
-            self.port = self.find_arduino()
-            if self.port is None:
-                return False
-        try:
-            self.serial = serial.Serial(self.port, self.baudrate, timeout=0.1)
-            time.sleep(2)
-            self.serial.reset_input_buffer()
-            self.serial.reset_output_buffer()
-            self.connected = True
-            self.reading = True
-            self.read_thread = threading.Thread(target=self._read_loop, daemon=True)
-            self.read_thread.start()
-            return True
-        except serial.SerialException:
-            return False
-
-    def disconnect(self):
-        """Disconnect from Arduino."""
-        self.reading = False
-        if self.serial and self.serial.is_open:
-            self.serial.close()
-        self.connected = False
-
-    def _read_loop(self):
-        """Background thread to read serial responses."""
-        while self.reading and self.serial and self.serial.is_open:
-            try:
-                if self.serial.in_waiting:
-                    line = self.serial.readline().decode('utf-8', errors='ignore').strip()
-                    if line:
-                        self.last_response = line
-                        if line.startswith("POS:"):
-                            try:
-                                self.position = float(line[4:])
-                            except:
-                                pass
-            except:
-                pass
-            time.sleep(0.01)
-
-    def send(self, command):
-        """Send a command to the Arduino."""
-        if not self.connected:
-            return False
-        try:
-            cmd = command.strip() + '\n'
-            self.serial.write(cmd.encode())
-            self.serial.flush()
-            return True
-        except:
-            return False
-
-    def feed(self, mm):
-        return self.send(f"F{mm}")
-
-    def retract(self, mm):
-        return self.send(f"R{mm}")
-
-    def set_speed(self, mm_per_sec):
-        return self.send(f"S{mm_per_sec}")
-
-    def jog_forward(self):
-        return self.send("J+")
-
-    def jog_reverse(self):
-        return self.send("J-")
-
-    def stop(self):
-        return self.send("STOP")
-
-    def home(self):
-        return self.send("HOME")
-
-    def get_position(self):
-        return self.send("POS")
+# Import from shared location
+sys.path.insert(0, os.path.expanduser('~/.frl'))
+from FRL_tube_feeder import TubeFeederController
 
 
 # =============================================================================
@@ -251,11 +147,40 @@ class RobotController:
     def _parse_response(self, line):
         """Parse position feedback from robot."""
         # AR4 sends position data in format: A1.23B4.56C... etc.
+        # Example: A10.50B-5.25C30.00D0.00E45.00F-90.00J100.00
         try:
-            if line.startswith("A"):
-                # Parse joint angles
-                pass  # Implement based on actual AR4 response format
-        except:
+            if line.startswith("A") and "B" in line:
+                # Parse joint angles from response
+                # Match pattern like A10.50B-5.25C30.00D0.00E45.00F-90.00J100.00
+                pattern = r'A([-\d.]+)B([-\d.]+)C([-\d.]+)D([-\d.]+)E([-\d.]+)F([-\d.]+)'
+                match = re.search(pattern, line)
+                if match:
+                    self.joints = [float(match.group(i)) for i in range(1, 7)]
+
+                # Also parse J7 if present
+                j7_match = re.search(r'J([-\d.]+)', line)
+                if j7_match:
+                    self.j7_pos = float(j7_match.group(1))
+
+            elif line.startswith("X") and "Y" in line:
+                # Parse Cartesian position: X100.0Y200.0Z300.0Rx0.0Ry0.0Rz0.0
+                pattern = r'X([-\d.]+)Y([-\d.]+)Z([-\d.]+)'
+                match = re.search(pattern, line)
+                if match:
+                    self.cartesian[0] = float(match.group(1))
+                    self.cartesian[1] = float(match.group(2))
+                    self.cartesian[2] = float(match.group(3))
+
+                rx_match = re.search(r'Rx([-\d.]+)', line)
+                ry_match = re.search(r'Ry([-\d.]+)', line)
+                rz_match = re.search(r'Rz([-\d.]+)', line)
+                if rx_match:
+                    self.cartesian[3] = float(rx_match.group(1))
+                if ry_match:
+                    self.cartesian[4] = float(ry_match.group(1))
+                if rz_match:
+                    self.cartesian[5] = float(rz_match.group(1))
+        except Exception:
             pass
 
     def send(self, command):
@@ -280,31 +205,39 @@ class RobotController:
         Start live jogging a joint.
         joint: 1-6 for main joints, 7 for linear track
         direction: +1 or -1
+        speed: 1-100 (will be scaled to robot's range: 1-25)
         """
+        # Scale 1-100% to robot range 1-25
+        robot_speed = max(1, int(speed * 25 / 100))
         # Live jog command format: LJ + joint code
         # Code: J1- = 10, J1+ = 11, J2- = 20, J2+ = 21, etc.
         code = joint * 10 + (1 if direction > 0 else 0)
         self.jogging = True
-        return self.send(f"LJ{code}S{speed}A{accel}D{decel}")
+        return self.send(f"LJ{code}S{robot_speed}A{accel}D{decel}")
 
     def jog_cartesian(self, axis, direction, speed=25, accel=10, decel=10):
         """
         Start live jogging in Cartesian space.
         axis: 'X', 'Y', 'Z', 'Rx', 'Ry', 'Rz'
         direction: +1 or -1
+        speed: 1-100 (will be scaled to robot's range: 1-25)
         """
+        # Scale 1-100% to robot range 1-25
+        robot_speed = max(1, int(speed * 25 / 100))
         axis_map = {'X': 1, 'Y': 2, 'Z': 3, 'Rx': 4, 'Ry': 5, 'Rz': 6}
         if axis not in axis_map:
             return False
         code = axis_map[axis] * 10 + (1 if direction > 0 else 0)
         self.jogging = True
-        return self.send(f"LC{code}S{speed}A{accel}D{decel}")
+        return self.send(f"LC{code}S{robot_speed}A{accel}D{decel}")
 
-    def jog_j7(self, direction, speed=25):
+    def jog_j7(self, direction, speed=25, accel=10, decel=10):
         """Jog linear track (J7)."""
+        # Scale 1-100% to robot range 1-25
+        robot_speed = max(1, int(speed * 25 / 100))
         code = 70 + (1 if direction > 0 else 0)
         self.jogging = True
-        return self.send(f"LJ{code}S{speed}")
+        return self.send(f"LJ{code}S{robot_speed}A{accel}D{decel}")
 
     def emergency_stop(self):
         """Emergency stop."""
@@ -592,11 +525,11 @@ class XboxController:
                         elif event.code == 'ABS_RY':
                             self.right_stick = (self.right_stick[0], -event.state / 32767.0)
 
-                        # Triggers
+                        # Triggers (Xbox Series uses 0-1023, older uses 0-255)
                         elif event.code == 'ABS_Z':
-                            self.left_trigger = event.state / 255.0
+                            self.left_trigger = min(1.0, event.state / 1023.0)
                         elif event.code == 'ABS_RZ':
-                            self.right_trigger = event.state / 255.0
+                            self.right_trigger = min(1.0, event.state / 1023.0)
 
                         if self.on_stick_move:
                             self.on_stick_move(self.left_stick, self.right_stick)
@@ -627,12 +560,20 @@ class XboxToolbox:
     MOVE_JOINT = 0
     MOVE_CARTESIAN = 1
 
+    # Operation modes (Train/Move)
+    OP_MOVE = 0
+    OP_TRAIN = 1
+    OP_NAMES = ["Move", "Train"]
+
     # Config file for saving window geometry
     CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.xbox_toolbox_config.json')
 
+    # Pathway storage directory
+    PATHWAY_DIR = os.path.expanduser('~/.xbox_toolbox_pathways')
+
     def __init__(self, root):
         self.root = root
-        self.root.title("Xbox Toolbox - AR4 Multi-Robot Control")
+        self.root.title("Xbox Toolbox - FRL Multi-Robot Control")
         self.root.resizable(True, True)
 
         # Load saved geometry or use default
@@ -648,7 +589,21 @@ class XboxToolbox:
         self.device_mode = self.MODE_ROBOT1
         self.move_mode = self.MOVE_JOINT
         self.speed = DEFAULT_SPEED
+        self.smoothness = 50  # 1-100: higher = gentler accel/decel
         self.current_jog = None  # Track what's currently jogging
+
+        # Train/Move mode state
+        self.operation_mode = self.OP_MOVE  # Start in Move mode
+        self.pathway = {'name': '', 'robot_mode': 'r1', 'waypoints': []}
+        self.playback_active = False
+        self.playback_loop = False
+        self.playback_thread = None
+
+        # Feeder has independent speed control (mm/sec)
+        self.feeder_speed = 10  # Default 10 mm/sec
+
+        # Ensure pathway directory exists
+        os.makedirs(self.PATHWAY_DIR, exist_ok=True)
 
         # Build GUI
         self._build_gui()
@@ -662,28 +617,82 @@ class XboxToolbox:
         # Start status update loop
         self._update_status()
 
-    def _load_geometry(self):
-        """Load saved window geometry from config file."""
+    def _load_config(self):
+        """Load saved configuration from config file."""
+        self._config = {}
         try:
             if os.path.exists(self.CONFIG_FILE):
                 with open(self.CONFIG_FILE, 'r') as f:
-                    config = json.load(f)
-                    geometry = config.get('geometry', '600x800+100+100')
+                    self._config = json.load(f)
+                    geometry = self._config.get('geometry', '600x800+100+100')
                     self.root.geometry(geometry)
             else:
                 self.root.geometry("600x800+100+100")
         except Exception:
             self.root.geometry("600x800+100+100")
 
-    def _save_geometry(self):
-        """Save current window geometry to config file."""
+    def _save_config(self):
+        """Save current configuration to config file."""
         try:
-            geometry = self.root.geometry()
-            config = {'geometry': geometry}
+            self._config['geometry'] = self.root.geometry()
+            # Save port selections
+            self._config['robot1_port'] = self.r1_port_var.get()
+            self._config['robot2_port'] = self.r2_port_var.get()
+            self._config['feeder_port'] = self.feeder_port_var.get()
+            # Save speed settings
+            self._config['speed'] = self.speed
+            self._config['smoothness'] = self.smoothness
+            self._config['feeder_speed'] = self.feeder_speed
             with open(self.CONFIG_FILE, 'w') as f:
-                json.dump(config, f)
+                json.dump(self._config, f, indent=2)
         except Exception:
             pass
+
+    def _apply_saved_ports(self):
+        """Apply saved port selections after GUI is built."""
+        if hasattr(self, '_config'):
+            # Restore port selections if they exist in available ports
+            ports = [p.device for p in serial.tools.list_ports.comports()]
+
+            saved_r1 = self._config.get('robot1_port', '')
+            if saved_r1 and saved_r1 in ports:
+                self.r1_port_var.set(saved_r1)
+
+            saved_r2 = self._config.get('robot2_port', '')
+            if saved_r2 and saved_r2 in ports:
+                self.r2_port_var.set(saved_r2)
+
+            saved_feeder = self._config.get('feeder_port', '')
+            if saved_feeder and saved_feeder in ports:
+                self.feeder_port_var.set(saved_feeder)
+
+            # Restore speed
+            saved_speed = self._config.get('speed', DEFAULT_SPEED)
+            self.speed = saved_speed
+            self.speed_var.set(saved_speed)
+            self.speed_label.config(text=f"{saved_speed}%")
+            self._draw_speed_bar()
+
+            # Restore smoothness
+            saved_smooth = self._config.get('smoothness', 50)
+            self.smoothness = saved_smooth
+            self.smooth_var.set(saved_smooth)
+            self.smooth_label.config(text=f"{saved_smooth}%")
+            self._draw_smooth_bar()
+
+            # Restore feeder speed
+            saved_feeder_speed = self._config.get('feeder_speed', 10)
+            self.feeder_speed = saved_feeder_speed
+            self.feeder_speed_var.set(saved_feeder_speed)
+            self.feeder_speed_label.config(text=f"{saved_feeder_speed} mm/s")
+
+    def _load_geometry(self):
+        """Load saved window geometry from config file (legacy wrapper)."""
+        self._load_config()
+
+    def _save_geometry(self):
+        """Save current window geometry to config file (legacy wrapper)."""
+        self._save_config()
 
     def _build_gui(self):
         """Build the Tkinter GUI with dark cyber theme."""
@@ -746,10 +755,20 @@ class XboxToolbox:
                               fg=self.colors['accent'], bg=self.colors['bg_dark'])
         title_label.pack(side=tk.LEFT)
 
-        subtitle = tk.Label(header_frame, text="AR4 Multi-Robot Control",
+        subtitle = tk.Label(header_frame, text="FRL Multi-Robot Control",
                            font=("Consolas", 10),
                            fg=self.colors['text_dim'], bg=self.colors['bg_dark'])
         subtitle.pack(side=tk.LEFT, padx=15, pady=8)
+
+        # Help button
+        help_btn = tk.Button(header_frame, text="?",
+                            font=("Consolas", 14, "bold"),
+                            bg=self.colors['bg_light'], fg=self.colors['accent2'],
+                            activebackground=self.colors['accent2'],
+                            activeforeground=self.colors['bg_dark'],
+                            relief=tk.FLAT, cursor='hand2', width=3,
+                            command=self._show_help)
+        help_btn.pack(side=tk.RIGHT, padx=5)
 
         # === STATUS BAR (Top) ===
         status_bar = tk.Frame(main_frame, bg=self.colors['bg_mid'], height=50)
@@ -760,22 +779,104 @@ class XboxToolbox:
         self._create_led_indicator(status_bar, "XBOX", 0)
         self._create_led_indicator(status_bar, "R1", 1)
         self._create_led_indicator(status_bar, "R2", 2)
-        self._create_led_indicator(status_bar, "J9", 3)
+        self._create_led_indicator(status_bar, "FEED", 3)
 
         # === ACTIVE MODE DISPLAY ===
-        mode_display = tk.Frame(main_frame, bg=self.colors['bg_mid'], height=80)
+        mode_display = tk.Frame(main_frame, bg=self.colors['bg_mid'], height=100)
         mode_display.pack(fill=tk.X, pady=5)
         mode_display.pack_propagate(False)
 
-        self.mode_label = tk.Label(mode_display, text="◉ ROBOT 1",
+        # Top row: Robot mode and Train/Move toggle
+        mode_top = tk.Frame(mode_display, bg=self.colors['bg_mid'])
+        mode_top.pack(fill=tk.X, pady=5)
+
+        self.mode_label = tk.Label(mode_top, text="◉ ROBOT 1",
                                    font=("Consolas", 22, "bold"),
                                    fg=self.colors['accent2'], bg=self.colors['bg_mid'])
-        self.mode_label.pack(pady=10)
+        self.mode_label.pack(side=tk.LEFT, padx=20)
+
+        # Train/Move toggle button
+        self.train_move_btn = tk.Button(mode_top, text="▶ MOVE",
+                                        font=("Consolas", 14, "bold"),
+                                        bg=self.colors['success'], fg=self.colors['bg_dark'],
+                                        activebackground=self.colors['accent'],
+                                        relief=tk.FLAT, cursor='hand2', width=10,
+                                        command=self._toggle_operation_mode)
+        self.train_move_btn.pack(side=tk.RIGHT, padx=20)
 
         self.movement_mode_label = tk.Label(mode_display, text="[ JOINT MODE ]",
                                             font=("Consolas", 12),
                                             fg=self.colors['success'], bg=self.colors['bg_mid'])
         self.movement_mode_label.pack()
+
+        # === PATHWAY PANEL (for Train mode) ===
+        self.pathway_frame = tk.Frame(main_frame, bg=self.colors['bg_light'])
+        self.pathway_frame.pack(fill=tk.X, pady=5)
+
+        # Pathway info row
+        pathway_info = tk.Frame(self.pathway_frame, bg=self.colors['bg_light'])
+        pathway_info.pack(fill=tk.X, padx=10, pady=5)
+
+        tk.Label(pathway_info, text="PATHWAY", font=("Consolas", 10, "bold"),
+                fg=self.colors['accent2'], bg=self.colors['bg_light']).pack(side=tk.LEFT)
+
+        self.waypoint_count_label = tk.Label(pathway_info, text="Waypoints: 0",
+                                             font=("Consolas", 10),
+                                             fg=self.colors['text'], bg=self.colors['bg_light'])
+        self.waypoint_count_label.pack(side=tk.LEFT, padx=20)
+
+        # Playback indicator
+        self.playback_label = tk.Label(pathway_info, text="",
+                                       font=("Consolas", 10, "bold"),
+                                       fg=self.colors['accent'], bg=self.colors['bg_light'])
+        self.playback_label.pack(side=tk.RIGHT, padx=10)
+
+        # Loop checkbox
+        self.loop_var = tk.BooleanVar(value=False)
+        loop_cb = tk.Checkbutton(pathway_info, text="Loop", variable=self.loop_var,
+                                 font=("Consolas", 9), bg=self.colors['bg_light'],
+                                 fg=self.colors['text'], selectcolor=self.colors['bg_mid'],
+                                 activebackground=self.colors['bg_light'],
+                                 command=self._toggle_loop)
+        loop_cb.pack(side=tk.RIGHT, padx=5)
+
+        # Pathway name and buttons row
+        pathway_ctrl = tk.Frame(self.pathway_frame, bg=self.colors['bg_light'])
+        pathway_ctrl.pack(fill=tk.X, padx=10, pady=5)
+
+        tk.Label(pathway_ctrl, text="Name:", font=("Consolas", 9),
+                fg=self.colors['text_dim'], bg=self.colors['bg_light']).pack(side=tk.LEFT)
+
+        self.pathway_name_var = tk.StringVar(value="pathway_1")
+        self.pathway_name_entry = tk.Entry(pathway_ctrl, textvariable=self.pathway_name_var,
+                                           font=("Consolas", 10), width=15,
+                                           bg=self.colors['bg_mid'], fg=self.colors['text'],
+                                           insertbackground=self.colors['text'])
+        self.pathway_name_entry.pack(side=tk.LEFT, padx=5)
+
+        # Button style for pathway controls
+        btn_cfg = {'font': ("Consolas", 9), 'bg': self.colors['bg_mid'],
+                   'fg': self.colors['text'], 'relief': tk.FLAT, 'cursor': 'hand2', 'width': 6}
+
+        self.save_btn = tk.Button(pathway_ctrl, text="Save", command=self._save_pathway, **btn_cfg)
+        self.save_btn.pack(side=tk.LEFT, padx=2)
+
+        self.load_btn = tk.Button(pathway_ctrl, text="Load", command=self._show_load_dialog, **btn_cfg)
+        self.load_btn.pack(side=tk.LEFT, padx=2)
+
+        self.clear_btn = tk.Button(pathway_ctrl, text="Clear", command=self._clear_pathway, **btn_cfg)
+        self.clear_btn.pack(side=tk.LEFT, padx=2)
+
+        # Play/Stop button
+        self.play_btn = tk.Button(pathway_ctrl, text="▶ Play",
+                                  font=("Consolas", 9, "bold"),
+                                  bg=self.colors['success'], fg=self.colors['bg_dark'],
+                                  relief=tk.FLAT, cursor='hand2', width=8,
+                                  command=self._toggle_playback)
+        self.play_btn.pack(side=tk.RIGHT, padx=2)
+
+        # Initially hide pathway panel (shown only in Train mode)
+        self.pathway_frame.pack_forget()
 
         # === CONNECTION PANELS (Grid) ===
         conn_frame = tk.Frame(main_frame, bg=self.colors['bg_dark'])
@@ -796,8 +897,8 @@ class XboxToolbox:
         self.r2_status_led = r2_panel['led']
         r2_panel['button'].configure(command=self._connect_robot2)
 
-        # J9 Tube Feeder
-        j9_panel = self._create_connection_panel(conn_frame, "J9 FEEDER", 2)
+        # Tube Feeder
+        j9_panel = self._create_connection_panel(conn_frame, "TUBE FEEDER", 2)
         self.feeder_port_var = j9_panel['port_var']
         self.feeder_port_combo = j9_panel['combo']
         self.feeder_status_led = j9_panel['led']
@@ -820,6 +921,66 @@ class XboxToolbox:
                                     font=("Consolas", 14, "bold"),
                                     fg=self.colors['success'], bg=self.colors['bg_dark'])
         self.speed_label.pack(side=tk.LEFT, padx=10)
+
+        # === SMOOTHNESS CONTROL ===
+        smooth_frame = tk.Frame(main_frame, bg=self.colors['bg_dark'])
+        smooth_frame.pack(fill=tk.X, pady=5)
+
+        tk.Label(smooth_frame, text="SMOOTH", font=("Consolas", 10, "bold"),
+                fg=self.colors['accent2'], bg=self.colors['bg_dark']).pack(side=tk.LEFT)
+
+        self.smooth_var = tk.IntVar(value=50)
+        self.smooth_canvas = tk.Canvas(smooth_frame, width=300, height=25,
+                                       bg=self.colors['bg_mid'], highlightthickness=0)
+        self.smooth_canvas.pack(side=tk.LEFT, padx=10)
+        self._draw_smooth_bar()
+
+        self.smooth_label = tk.Label(smooth_frame, text="50%",
+                                     font=("Consolas", 14, "bold"),
+                                     fg=self.colors['accent2'], bg=self.colors['bg_dark'])
+        self.smooth_label.pack(side=tk.LEFT, padx=10)
+
+        # Smoothness preset buttons
+        for val, name in [(20, "Snappy"), (50, "Normal"), (80, "Gentle")]:
+            tk.Button(smooth_frame, text=name, font=("Consolas", 8),
+                     bg=self.colors['bg_mid'], fg=self.colors['text'],
+                     relief=tk.FLAT, width=6, cursor='hand2',
+                     command=lambda v=val: self._set_smoothness(v)).pack(side=tk.LEFT, padx=2)
+
+        # === FEEDER SPEED CONTROL ===
+        feeder_speed_frame = tk.Frame(main_frame, bg=self.colors['bg_dark'])
+        feeder_speed_frame.pack(fill=tk.X, pady=5)
+
+        tk.Label(feeder_speed_frame, text="FEEDER", font=("Consolas", 10, "bold"),
+                fg=self.colors['warning'], bg=self.colors['bg_dark']).pack(side=tk.LEFT)
+
+        # Decrease button
+        tk.Button(feeder_speed_frame, text="-", font=("Consolas", 12, "bold"),
+                 bg=self.colors['bg_light'], fg=self.colors['text'],
+                 relief=tk.FLAT, width=2, cursor='hand2',
+                 command=self._decrease_feeder_speed).pack(side=tk.LEFT, padx=(10, 2))
+
+        self.feeder_speed_var = tk.IntVar(value=self.feeder_speed)
+        self.feeder_speed_label = tk.Label(feeder_speed_frame, text=f"{self.feeder_speed} mm/s",
+                                           font=("Consolas", 12, "bold"),
+                                           fg=self.colors['warning'], bg=self.colors['bg_dark'],
+                                           width=10)
+        self.feeder_speed_label.pack(side=tk.LEFT, padx=5)
+
+        # Increase button
+        tk.Button(feeder_speed_frame, text="+", font=("Consolas", 12, "bold"),
+                 bg=self.colors['bg_light'], fg=self.colors['text'],
+                 relief=tk.FLAT, width=2, cursor='hand2',
+                 command=self._increase_feeder_speed).pack(side=tk.LEFT, padx=2)
+
+        # Preset buttons for common speeds
+        tk.Label(feeder_speed_frame, text="  Presets:", font=("Consolas", 9),
+                fg=self.colors['text_dim'], bg=self.colors['bg_dark']).pack(side=tk.LEFT, padx=(15, 5))
+        for spd in [5, 10, 25, 50]:
+            tk.Button(feeder_speed_frame, text=str(spd), font=("Consolas", 9),
+                     bg=self.colors['bg_mid'], fg=self.colors['text'],
+                     relief=tk.FLAT, width=3, cursor='hand2',
+                     command=lambda s=spd: self._set_feeder_speed(s)).pack(side=tk.LEFT, padx=1)
 
         # === CURRENT ACTION ===
         action_frame = tk.Frame(main_frame, bg=self.colors['bg_light'], height=50)
@@ -847,22 +1008,29 @@ class XboxToolbox:
         map_frame = tk.Frame(main_frame, bg=self.colors['bg_mid'])
         map_frame.pack(fill=tk.X, pady=5)
 
+        # Labels for button mapping that will change based on mode
+        self.mapping_labels = {}
+
         mapping_lines = [
-            ("A/B", "Mode", self.colors['success']),
+            ("A", "Joint", self.colors['success']),
+            ("B", "Cartsn", self.colors['success']),
             ("Back", "Robot", self.colors['warning']),
             ("Start", "E-STOP", self.colors['accent']),
-            ("L-Stick", "J1/J2", self.colors['accent2']),
-            ("R-Stick", "J3/J4", self.colors['accent2']),
+            ("Sticks", "J1-4", self.colors['accent2']),
             ("D-pad", "J5/J6", self.colors['accent2']),
-            ("X/Y", "J7 Track", self.colors['success']),
-            ("LB/RB", "J9 Feed", self.colors['warning']),
+            ("X/Y", "Track", self.colors['success']),
+            ("LB/RB", "Feeder", self.colors['warning']),
         ]
 
         for i, (btn, action, color) in enumerate(mapping_lines):
             tk.Label(map_frame, text=btn, font=("Consolas", 8, "bold"),
                     fg=color, bg=self.colors['bg_mid']).grid(row=0, column=i*2, padx=3, pady=5)
-            tk.Label(map_frame, text=action, font=("Consolas", 8),
-                    fg=self.colors['text_dim'], bg=self.colors['bg_mid']).grid(row=1, column=i*2, padx=3)
+            lbl = tk.Label(map_frame, text=action, font=("Consolas", 8),
+                    fg=self.colors['text_dim'], bg=self.colors['bg_mid'])
+            lbl.grid(row=1, column=i*2, padx=3)
+            # Store labels that change in Train mode
+            if btn in ["A", "B", "Start"]:
+                self.mapping_labels[btn] = lbl
 
         # === LOG ===
         log_frame = tk.Frame(main_frame, bg=self.colors['bg_dark'])
@@ -887,8 +1055,47 @@ class XboxToolbox:
                             command=self._connect_xbox)
         xbox_btn.pack(fill=tk.X, pady=5)
 
-        # Populate ports
+        # Populate ports and restore saved selections
         self._refresh_ports()
+        self._apply_saved_ports()
+
+        # Auto-connect to FRL devices on startup
+        self.root.after(500, self._auto_connect_frl)
+
+    def _auto_connect_frl(self):
+        """Auto-connect to FRL udev symlinks and Xbox controller on startup."""
+        connected = []
+
+        # Xbox controller
+        if self.xbox.connect():
+            self.xbox.start_polling()
+            connected.append("Xbox")
+
+        # Robot 1
+        if os.path.exists(FRL_ROBOT1_PORT):
+            self.r1_port_var.set(FRL_ROBOT1_PORT)
+            self.robot1.port = FRL_ROBOT1_PORT
+            if self.robot1.connect():
+                connected.append("Robot 1")
+
+        # Robot 2
+        if os.path.exists(FRL_ROBOT2_PORT):
+            self.r2_port_var.set(FRL_ROBOT2_PORT)
+            self.robot2.port = FRL_ROBOT2_PORT
+            if self.robot2.connect():
+                connected.append("Robot 2")
+
+        # Feeder
+        if os.path.exists(FRL_FEEDER_PORT):
+            self.feeder_port_var.set(FRL_FEEDER_PORT)
+            self.feeder.port = FRL_FEEDER_PORT
+            if self.feeder.connect():
+                connected.append("Feeder")
+
+        if connected:
+            self._log(f"Auto-connected: {', '.join(connected)}")
+        else:
+            self._log("No devices found - connect manually")
 
     def _create_led_indicator(self, parent, label, col):
         """Create an LED-style status indicator."""
@@ -909,7 +1116,7 @@ class XboxToolbox:
             self.r1_led = led
         elif label == "R2":
             self.r2_led = led
-        elif label == "J9":
+        elif label == "FEED":
             self.feeder_led = led
 
     def _create_connection_panel(self, parent, title, col):
@@ -965,6 +1172,36 @@ class XboxToolbox:
             color = self.colors['success'] if speed < 70 else (self.colors['warning'] if speed < 90 else self.colors['accent'])
             self.speed_canvas.create_rectangle(5, 5, 5 + width, 20, fill=color, outline='')
 
+    def _draw_smooth_bar(self):
+        """Draw the smoothness bar visualization."""
+        self.smooth_canvas.delete("all")
+        smooth = self.smooth_var.get()
+        width = int(290 * smooth / 100)
+
+        # Background
+        self.smooth_canvas.create_rectangle(5, 5, 295, 20, fill=self.colors['bg_dark'], outline='')
+
+        # Bar color based on smoothness level
+        if smooth > 0:
+            color = self.colors['accent2']
+            self.smooth_canvas.create_rectangle(5, 5, 5 + width, 20, fill=color, outline='')
+
+    def _set_smoothness(self, value):
+        """Set smoothness value (1-100)."""
+        self.smoothness = max(1, min(100, value))
+        self.smooth_var.set(self.smoothness)
+        self.smooth_label.config(text=f"{self.smoothness}%")
+        self._draw_smooth_bar()
+
+    def _get_accel_decel(self):
+        """Convert smoothness to accel/decel values for robot (1-25 range)."""
+        # High smoothness = low accel/decel = gentle motion
+        # smoothness 100 → accel 1 (very gentle)
+        # smoothness 50 → accel 13 (medium)
+        # smoothness 1 → accel 25 (snappy)
+        accel = max(1, int(26 - (self.smoothness * 25 / 100)))
+        return accel, accel  # Same value for accel and decel
+
     def _set_led(self, led_canvas, connected):
         """Set LED indicator state."""
         led_canvas.delete("all")
@@ -981,28 +1218,30 @@ class XboxToolbox:
         self.log_text.configure(state=tk.DISABLED)
 
     def _refresh_ports(self):
-        """Refresh available serial ports."""
+        """Refresh available serial ports, prioritizing FRL udev symlinks."""
+        # Get standard ports
         ports = [p.device for p in serial.tools.list_ports.comports()]
-        self.r1_port_combo['values'] = ports
-        self.r2_port_combo['values'] = ports
-        self.feeder_port_combo['values'] = ports
 
-        # Auto-select if only one Teensy
-        teensys = []
-        arduinos = []
-        for p in serial.tools.list_ports.comports():
-            desc = p.description.lower() if p.description else ''
-            if 'teensy' in desc:
-                teensys.append(p.device)
-            elif 'arduino' in desc:
-                arduinos.append(p.device)
+        # Check for FRL udev symlinks and add them to the front
+        frl_ports = []
+        for frl_port in [FRL_ROBOT1_PORT, FRL_ROBOT2_PORT, FRL_FEEDER_PORT]:
+            if os.path.exists(frl_port):
+                frl_ports.append(frl_port)
 
-        if len(teensys) >= 1:
-            self.r1_port_var.set(teensys[0])
-        if len(teensys) >= 2:
-            self.r2_port_var.set(teensys[1])
-        if arduinos:
-            self.feeder_port_var.set(arduinos[0])
+        # Combine: FRL symlinks first, then standard ports
+        all_ports = frl_ports + [p for p in ports if p not in frl_ports]
+
+        self.r1_port_combo['values'] = all_ports
+        self.r2_port_combo['values'] = all_ports
+        self.feeder_port_combo['values'] = all_ports
+
+        # Auto-select FRL symlinks if they exist
+        if os.path.exists(FRL_ROBOT1_PORT):
+            self.r1_port_var.set(FRL_ROBOT1_PORT)
+        if os.path.exists(FRL_ROBOT2_PORT):
+            self.r2_port_var.set(FRL_ROBOT2_PORT)
+        if os.path.exists(FRL_FEEDER_PORT):
+            self.feeder_port_var.set(FRL_FEEDER_PORT)
 
     def _connect_xbox(self):
         """Connect Xbox controller."""
@@ -1061,6 +1300,21 @@ class XboxToolbox:
         self.speed_label.config(text=f"{self.speed}%")
         self._draw_speed_bar()
 
+    def _set_feeder_speed(self, speed):
+        """Set the feeder speed."""
+        self.feeder_speed = max(1, min(100, speed))
+        self.feeder_speed_var.set(self.feeder_speed)
+        self.feeder_speed_label.config(text=f"{self.feeder_speed} mm/s")
+        self._log(f"Feeder speed: {self.feeder_speed} mm/s")
+
+    def _increase_feeder_speed(self):
+        """Increase feeder speed by 5 mm/s."""
+        self._set_feeder_speed(self.feeder_speed + 5)
+
+    def _decrease_feeder_speed(self):
+        """Decrease feeder speed by 5 mm/s."""
+        self._set_feeder_speed(self.feeder_speed - 5)
+
     def _emergency_stop_all(self):
         """Emergency stop all devices."""
         self._log("!!! EMERGENCY STOP ALL !!!")
@@ -1105,39 +1359,54 @@ class XboxToolbox:
 
     def _on_button_press(self, button):
         """Handle Xbox button press."""
-        # Back = cycle device
+        # Back = cycle device (always available)
         if button == XboxController.BTN_BACK:
             self._cycle_device_mode()
 
-        # Start = emergency stop
+        # Start behavior depends on mode
         elif button == XboxController.BTN_START:
-            self._emergency_stop_all()
+            if self.operation_mode == self.OP_TRAIN:
+                # In Train mode: toggle playback
+                self._toggle_playback()
+            else:
+                # In Move mode: emergency stop
+                self._emergency_stop_all()
 
-        # A = joint mode
+        # A button behavior depends on mode
         elif button == XboxController.BTN_A:
-            self._set_move_mode(self.MOVE_JOINT)
+            if self.operation_mode == self.OP_TRAIN:
+                # In Train mode: add waypoint
+                self._capture_waypoint()
+            else:
+                # In Move mode: switch to joint mode
+                self._set_move_mode(self.MOVE_JOINT)
 
-        # B = cartesian mode
+        # B button behavior depends on mode
         elif button == XboxController.BTN_B:
-            self._set_move_mode(self.MOVE_CARTESIAN)
+            if self.operation_mode == self.OP_TRAIN:
+                # In Train mode: delete last waypoint
+                self._delete_last_waypoint()
+            else:
+                # In Move mode: switch to cartesian mode
+                self._set_move_mode(self.MOVE_CARTESIAN)
 
-        # X = J7 negative (linear track)
+        # X = J7 negative (linear track) - always available for positioning
         elif button == XboxController.BTN_X:
             self._jog_j7(-1)
 
-        # Y = J7 positive (linear track)
+        # Y = J7 positive (linear track) - always available for positioning
         elif button == XboxController.BTN_Y:
             self._jog_j7(+1)
 
-        # LB = J9 retract (tube feeder reverse)
+        # LB = J9 retract (tube feeder reverse) - always available
         elif button == XboxController.BTN_LB:
             self._jog_j9(-1)
 
-        # RB = J9 feed (tube feeder forward)
+        # RB = J9 feed (tube feeder forward) - always available
         elif button == XboxController.BTN_RB:
             self._jog_j9(+1)
 
-        # D-pad
+        # D-pad - always available for positioning
         elif button == XboxController.DPAD_UP:
             self._jog_dpad('up')
         elif button == XboxController.DPAD_DOWN:
@@ -1207,42 +1476,58 @@ class XboxToolbox:
             elif abs(ry) >= abs(lx) and abs(ry) >= abs(ly) and abs(ry) >= abs(rx):
                 new_jog = ('C', 'Z', 1 if ry > 0 else -1)
 
-        # Only start new jog if different from current
+        # Start new jog or resend if direction changed or enough time passed
+        now = time.time()
+        if not hasattr(self, '_last_jog_send'):
+            self._last_jog_send = 0
+
         if new_jog != self.current_jog:
+            # Direction changed - stop and start new jog
             if self.current_jog is not None:
                 self._stop_all_jog()
-
             if new_jog is not None:
                 self._start_jog(new_jog)
+                self._last_jog_send = now
+        elif new_jog is not None and (now - self._last_jog_send) > 0.5:
+            # Same direction but resend periodically to keep robot moving
+            self._start_jog(new_jog)
+            self._last_jog_send = now
 
     def _on_trigger(self, left_trigger, right_trigger):
-        """Handle trigger input for speed adjustment (rate-limited)."""
-        # Rate limit: only change speed every 200ms
-        now = time.time()
-        if not hasattr(self, '_last_speed_change'):
-            self._last_speed_change = 0
+        """Handle trigger input for speed adjustment - increment/decrement with persistence."""
+        # Initialize state
+        if not hasattr(self, '_trigger_cooldown'):
+            self._trigger_cooldown = 0
 
-        if now - self._last_speed_change < 0.2:  # 200ms rate limit
+        now = time.time()
+        if now - self._trigger_cooldown < 0.15:  # 150ms between changes
             return
 
-        # RT increases speed, LT decreases
-        if right_trigger > 0.5:
-            new_speed = min(100, self.speed + 1)  # Slower increment
-            if new_speed != self.speed:
-                self.speed = new_speed
-                self.speed_var.set(new_speed)
-                self.speed_label.config(text=f"{self.speed}%")
-                self._draw_speed_bar()
-                self._last_speed_change = now
+        speed_changed = False
 
-        elif left_trigger > 0.5:
-            new_speed = max(1, self.speed - 1)  # Slower decrement
+        # RT increases speed when pressed past 20%
+        if right_trigger > 0.2:
+            new_speed = min(100, self.speed + 5)
             if new_speed != self.speed:
                 self.speed = new_speed
-                self.speed_var.set(new_speed)
-                self.speed_label.config(text=f"{self.speed}%")
-                self._draw_speed_bar()
-                self._last_speed_change = now
+                speed_changed = True
+                self._trigger_cooldown = now
+
+        # LT decreases speed when pressed past 20%
+        if left_trigger > 0.2 and not speed_changed:
+            new_speed = max(1, self.speed - 5)
+            if new_speed != self.speed:
+                self.speed = new_speed
+                speed_changed = True
+                self._trigger_cooldown = now
+
+        if speed_changed:
+            self.speed_var.set(self.speed)
+            self.speed_label.config(text=f"{self.speed}%")
+            self._draw_speed_bar()
+            # If currently jogging, resend with new speed
+            if self.current_jog is not None:
+                self._start_jog(self.current_jog)
 
     def _start_jog(self, jog_spec):
         """Start jogging based on spec."""
@@ -1259,18 +1544,20 @@ class XboxToolbox:
 
         action_text = ""
 
+        accel, decel = self._get_accel_decel()
+
         for robot in robots:
             if not robot.connected:
                 continue
 
             if jog_type == 'J':
                 # Joint jog
-                robot.jog_joint(axis, direction, self.speed)
+                robot.jog_joint(axis, direction, self.speed, accel, decel)
                 dir_str = "+" if direction > 0 else "-"
                 action_text = f"Jogging J{axis}{dir_str}"
             elif jog_type == 'C':
                 # Cartesian jog
-                robot.jog_cartesian(axis, direction, self.speed)
+                robot.jog_cartesian(axis, direction, self.speed, accel, decel)
                 dir_str = "+" if direction > 0 else "-"
                 action_text = f"Jogging {axis}{dir_str}"
 
@@ -1287,9 +1574,10 @@ class XboxToolbox:
         elif self.device_mode == self.MODE_BOTH:
             robots = [self.robot1, self.robot2]
 
+        accel, decel = self._get_accel_decel()
         for robot in robots:
             if robot.connected:
-                robot.jog_j7(direction, self.speed)
+                robot.jog_j7(direction, self.speed, accel, decel)
 
         dir_str = "+" if direction > 0 else "-"
         self.action_label.config(text=f"Jogging J7{dir_str} (Track)", foreground="blue")
@@ -1298,15 +1586,18 @@ class XboxToolbox:
     def _jog_j9(self, direction):
         """Jog J9 (tube feeder) - Arduino-controlled external axis."""
         if not self.feeder.connected:
-            self._log("Tube Feeder (J9) not connected")
+            self._log("Tube Feeder not connected")
             return
+
+        # Set feeder speed before jogging
+        self.feeder.set_speed(self.feeder_speed)
 
         if direction > 0:
             self.feeder.jog_forward()
-            self.action_label.config(text="J9+ (Tube Feed)", foreground="blue")
+            self.action_label.config(text=f"Tube Feed + ({self.feeder_speed}mm/s)", foreground="blue")
         else:
             self.feeder.jog_reverse()
-            self.action_label.config(text="J9- (Tube Retract)", foreground="blue")
+            self.action_label.config(text=f"Tube Retract - ({self.feeder_speed}mm/s)", foreground="blue")
         self.current_jog = ('J', 9, direction)
 
     def _jog_dpad(self, direction):
@@ -1319,50 +1610,452 @@ class XboxToolbox:
         elif self.device_mode == self.MODE_BOTH:
             robots = [self.robot1, self.robot2]
 
+        accel, decel = self._get_accel_decel()
+
         if self.move_mode == self.MOVE_JOINT:
             # D-pad = J5/J6
             if direction == 'up':
                 for r in robots:
-                    if r.connected: r.jog_joint(5, -1, self.speed)
+                    if r.connected: r.jog_joint(5, -1, self.speed, accel, decel)
                 self.action_label.config(text="Jogging J5-", foreground="blue")
                 self.current_jog = ('J', 5, -1)
             elif direction == 'down':
                 for r in robots:
-                    if r.connected: r.jog_joint(5, +1, self.speed)
+                    if r.connected: r.jog_joint(5, +1, self.speed, accel, decel)
                 self.action_label.config(text="Jogging J5+", foreground="blue")
                 self.current_jog = ('J', 5, +1)
             elif direction == 'left':
                 for r in robots:
-                    if r.connected: r.jog_joint(6, -1, self.speed)
+                    if r.connected: r.jog_joint(6, -1, self.speed, accel, decel)
                 self.action_label.config(text="Jogging J6-", foreground="blue")
                 self.current_jog = ('J', 6, -1)
             elif direction == 'right':
                 for r in robots:
-                    if r.connected: r.jog_joint(6, +1, self.speed)
+                    if r.connected: r.jog_joint(6, +1, self.speed, accel, decel)
                 self.action_label.config(text="Jogging J6+", foreground="blue")
                 self.current_jog = ('J', 6, +1)
         else:
             # Cartesian: D-pad = Rx/Ry
             if direction == 'up':
                 for r in robots:
-                    if r.connected: r.jog_cartesian('Rx', +1, self.speed)
+                    if r.connected: r.jog_cartesian('Rx', +1, self.speed, accel, decel)
                 self.action_label.config(text="Jogging Rx+", foreground="blue")
                 self.current_jog = ('C', 'Rx', +1)
             elif direction == 'down':
                 for r in robots:
-                    if r.connected: r.jog_cartesian('Rx', -1, self.speed)
+                    if r.connected: r.jog_cartesian('Rx', -1, self.speed, accel, decel)
                 self.action_label.config(text="Jogging Rx-", foreground="blue")
                 self.current_jog = ('C', 'Rx', -1)
             elif direction == 'left':
                 for r in robots:
-                    if r.connected: r.jog_cartesian('Ry', -1, self.speed)
+                    if r.connected: r.jog_cartesian('Ry', -1, self.speed, accel, decel)
                 self.action_label.config(text="Jogging Ry-", foreground="blue")
                 self.current_jog = ('C', 'Ry', -1)
             elif direction == 'right':
                 for r in robots:
-                    if r.connected: r.jog_cartesian('Ry', +1, self.speed)
+                    if r.connected: r.jog_cartesian('Ry', +1, self.speed, accel, decel)
                 self.action_label.config(text="Jogging Ry+", foreground="blue")
                 self.current_jog = ('C', 'Ry', +1)
+
+    # =========================================================================
+    # HELP DIALOG
+    # =========================================================================
+
+    def _show_help(self):
+        """Show help dialog with button mappings and usage info."""
+        help_win = tk.Toplevel(self.root)
+        help_win.title("Xbox Toolbox Help")
+        help_win.geometry("500x600")
+        help_win.configure(bg=self.colors['bg_dark'])
+        help_win.transient(self.root)
+
+        # Scrollable text area
+        text_frame = tk.Frame(help_win, bg=self.colors['bg_dark'])
+        text_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        scrollbar = tk.Scrollbar(text_frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        help_text = tk.Text(text_frame, font=("Consolas", 10),
+                           bg=self.colors['bg_mid'], fg=self.colors['text'],
+                           wrap=tk.WORD, yscrollcommand=scrollbar.set)
+        help_text.pack(fill=tk.BOTH, expand=True)
+        scrollbar.config(command=help_text.yview)
+
+        # Help content
+        content = """
+═══════════════════════════════════════════════
+           XBOX TOOLBOX - HELP
+═══════════════════════════════════════════════
+
+OPERATION MODES
+───────────────────────────────────────────────
+• MOVE MODE (Default): Manual robot jogging
+• TRAIN MODE: Record waypoints for playback
+
+Click the MOVE/TRAIN button to toggle modes.
+
+═══════════════════════════════════════════════
+MOVE MODE - BUTTON MAPPING
+═══════════════════════════════════════════════
+
+  A          → Joint Mode
+  B          → Cartesian Mode
+  Back       → Cycle Robot: R1 → R2 → Both
+  Start      → EMERGENCY STOP ALL
+
+  Left Stick  → J1/J2 (Joint) or X/Y (Cartesian)
+  Right Stick → J3/J4 (Joint) or Z/Rz (Cartesian)
+  D-pad       → J5/J6 (Joint) or Rx/Ry (Cartesian)
+
+  X          → J7 Track Negative
+  Y          → J7 Track Positive
+  LB         → Tube Feeder Retract
+  RB         → Tube Feeder Feed
+
+  LT         → Decrease Speed
+  RT         → Increase Speed
+
+═══════════════════════════════════════════════
+TRAIN MODE - BUTTON MAPPING
+═══════════════════════════════════════════════
+
+  A          → Add Waypoint (capture position)
+  B          → Delete Last Waypoint
+  Start      → Toggle Playback
+
+  All other buttons work the same as Move mode
+  for positioning the robot.
+
+═══════════════════════════════════════════════
+PATHWAY PANEL (Train Mode)
+═══════════════════════════════════════════════
+
+When in Train mode, a pathway panel appears:
+
+  • Waypoint Counter: Shows recorded waypoints
+  • Name Field: Enter pathway name
+  • Save: Save to ~/.xbox_toolbox_pathways/
+  • Load: Load a saved pathway
+  • Clear: Delete all waypoints
+  • Loop: Toggle continuous playback
+  • Play/Stop: Execute or stop pathway
+
+═══════════════════════════════════════════════
+QUICK START
+═══════════════════════════════════════════════
+
+1. Click "Connect Xbox Controller"
+2. Select ports and connect robots/feeder
+3. Use sticks and buttons to jog
+
+For pathway recording:
+1. Click MOVE to switch to TRAIN mode
+2. Position robot, press A to add waypoint
+3. Repeat to build pathway
+4. Enter name, click Save
+5. Click Play or press Start to execute
+
+═══════════════════════════════════════════════
+TROUBLESHOOTING
+═══════════════════════════════════════════════
+
+Xbox not detected:
+  • Ensure controller is connected via USB/BT
+  • Click "Connect Xbox Controller" button
+
+Serial ports not found:
+  • Check USB connections
+  • Run: sudo usermod -a -G dialout $USER
+  • Log out and back in
+
+Sticks not responding:
+  • Deadzone is 25% - push sticks further
+  • Check action display for values
+
+═══════════════════════════════════════════════
+"""
+        help_text.insert('1.0', content)
+        help_text.config(state=tk.DISABLED)
+
+        # Close button
+        tk.Button(help_win, text="Close", font=("Consolas", 11),
+                 bg=self.colors['accent2'], fg=self.colors['bg_dark'],
+                 command=help_win.destroy, width=10).pack(pady=10)
+
+    # =========================================================================
+    # TRAIN/MOVE MODE FUNCTIONS
+    # =========================================================================
+
+    def _toggle_operation_mode(self):
+        """Toggle between Train and Move modes."""
+        if self.playback_active:
+            self._stop_playback()
+
+        self.operation_mode = self.OP_TRAIN if self.operation_mode == self.OP_MOVE else self.OP_MOVE
+
+        if self.operation_mode == self.OP_TRAIN:
+            # Entering Train mode
+            self.train_move_btn.config(text="● TRAIN", bg=self.colors['accent'])
+            self.pathway_frame.pack(fill=tk.X, pady=5, after=self.train_move_btn.master.master)
+            # Update pathway robot mode to match current device mode
+            mode_map = {self.MODE_ROBOT1: 'r1', self.MODE_ROBOT2: 'r2', self.MODE_BOTH: 'both'}
+            self.pathway['robot_mode'] = mode_map[self.device_mode]
+            # Update button mapping labels for Train mode
+            self.mapping_labels['A'].config(text="AddWP")
+            self.mapping_labels['B'].config(text="DelWP")
+            self.mapping_labels['Start'].config(text="Play")
+            self._log("Entered TRAIN mode - A=Add waypoint, B=Delete last")
+        else:
+            # Entering Move mode
+            self.train_move_btn.config(text="▶ MOVE", bg=self.colors['success'])
+            self.pathway_frame.pack_forget()
+            # Restore button mapping labels for Move mode
+            self.mapping_labels['A'].config(text="Joint")
+            self.mapping_labels['B'].config(text="Cartsn")
+            self.mapping_labels['Start'].config(text="E-STOP")
+            self._log("Entered MOVE mode")
+
+    def _toggle_loop(self):
+        """Toggle loop playback mode."""
+        self.playback_loop = self.loop_var.get()
+
+    def _capture_waypoint(self):
+        """Capture current robot position as a waypoint."""
+        waypoint = {'r1': None, 'r2': None, 'feeder': 0.0}
+
+        # Request fresh position data from robot(s)
+        if self.device_mode in [self.MODE_ROBOT1, self.MODE_BOTH]:
+            if self.robot1.connected:
+                self.robot1.get_position()
+                time.sleep(0.1)  # Brief wait for response
+
+        if self.device_mode in [self.MODE_ROBOT2, self.MODE_BOTH]:
+            if self.robot2.connected:
+                self.robot2.get_position()
+                time.sleep(0.1)
+
+        # Request feeder position
+        if self.feeder.connected:
+            self.feeder.get_position()
+            time.sleep(0.05)
+
+        # Capture from robot(s) based on current device mode
+        if self.device_mode in [self.MODE_ROBOT1, self.MODE_BOTH]:
+            if self.robot1.connected:
+                waypoint['r1'] = {
+                    'joints': list(self.robot1.joints),
+                    'j7': self.robot1.j7_pos
+                }
+
+        if self.device_mode in [self.MODE_ROBOT2, self.MODE_BOTH]:
+            if self.robot2.connected:
+                waypoint['r2'] = {
+                    'joints': list(self.robot2.joints),
+                    'j7': self.robot2.j7_pos
+                }
+
+        # Capture feeder position
+        if self.feeder.connected:
+            waypoint['feeder'] = self.feeder.position
+
+        self.pathway['waypoints'].append(waypoint)
+        count = len(self.pathway['waypoints'])
+        self.waypoint_count_label.config(text=f"Waypoints: {count}")
+        self._log(f"Added waypoint #{count}")
+        self.action_label.config(text=f"Waypoint #{count} added", fg=self.colors['success'])
+
+    def _delete_last_waypoint(self):
+        """Delete the last waypoint from the pathway."""
+        if self.pathway['waypoints']:
+            self.pathway['waypoints'].pop()
+            count = len(self.pathway['waypoints'])
+            self.waypoint_count_label.config(text=f"Waypoints: {count}")
+            self._log(f"Deleted last waypoint (now {count})")
+            self.action_label.config(text=f"Waypoint deleted ({count} left)", fg=self.colors['warning'])
+        else:
+            self._log("No waypoints to delete")
+
+    def _clear_pathway(self):
+        """Clear all waypoints from the current pathway."""
+        self.pathway['waypoints'] = []
+        self.waypoint_count_label.config(text="Waypoints: 0")
+        self._log("Pathway cleared")
+        self.action_label.config(text="Pathway cleared", fg=self.colors['text'])
+
+    def _save_pathway(self):
+        """Save the current pathway to a file."""
+        name = self.pathway_name_var.get().strip()
+        if not name:
+            self._log("Error: Pathway name required")
+            return
+
+        if not self.pathway['waypoints']:
+            self._log("Error: No waypoints to save")
+            return
+
+        # Update pathway metadata
+        self.pathway['name'] = name
+        mode_map = {self.MODE_ROBOT1: 'r1', self.MODE_ROBOT2: 'r2', self.MODE_BOTH: 'both'}
+        self.pathway['robot_mode'] = mode_map[self.device_mode]
+        self.pathway['created'] = time.strftime('%Y-%m-%dT%H:%M:%S')
+
+        # Save to file
+        filepath = os.path.join(self.PATHWAY_DIR, f"{name}.json")
+        try:
+            with open(filepath, 'w') as f:
+                json.dump(self.pathway, f, indent=2)
+            self._log(f"Pathway saved: {name} ({len(self.pathway['waypoints'])} waypoints)")
+            self.action_label.config(text=f"Saved: {name}", fg=self.colors['success'])
+        except Exception as e:
+            self._log(f"Save failed: {e}")
+
+    def _show_load_dialog(self):
+        """Show a dialog to select and load a pathway."""
+        # List available pathways
+        try:
+            files = [f[:-5] for f in os.listdir(self.PATHWAY_DIR) if f.endswith('.json')]
+        except:
+            files = []
+
+        if not files:
+            self._log("No saved pathways found")
+            return
+
+        # Simple selection dialog
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Load Pathway")
+        dialog.geometry("300x200")
+        dialog.configure(bg=self.colors['bg_dark'])
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        tk.Label(dialog, text="Select Pathway:", font=("Consolas", 11),
+                bg=self.colors['bg_dark'], fg=self.colors['text']).pack(pady=10)
+
+        listbox = tk.Listbox(dialog, font=("Consolas", 10),
+                            bg=self.colors['bg_mid'], fg=self.colors['text'],
+                            selectbackground=self.colors['accent2'])
+        listbox.pack(fill=tk.BOTH, expand=True, padx=10)
+
+        for name in sorted(files):
+            listbox.insert(tk.END, name)
+
+        def load_selected():
+            selection = listbox.curselection()
+            if selection:
+                name = listbox.get(selection[0])
+                self._load_pathway(name)
+                dialog.destroy()
+
+        tk.Button(dialog, text="Load", font=("Consolas", 10),
+                 bg=self.colors['success'], fg=self.colors['bg_dark'],
+                 command=load_selected).pack(pady=10)
+
+    def _load_pathway(self, name):
+        """Load a pathway from file."""
+        filepath = os.path.join(self.PATHWAY_DIR, f"{name}.json")
+        try:
+            with open(filepath, 'r') as f:
+                self.pathway = json.load(f)
+            self.pathway_name_var.set(name)
+            count = len(self.pathway['waypoints'])
+            self.waypoint_count_label.config(text=f"Waypoints: {count}")
+            self._log(f"Loaded pathway: {name} ({count} waypoints)")
+            self.action_label.config(text=f"Loaded: {name}", fg=self.colors['success'])
+        except Exception as e:
+            self._log(f"Load failed: {e}")
+
+    def _toggle_playback(self):
+        """Toggle pathway playback."""
+        if self.playback_active:
+            self._stop_playback()
+        else:
+            self._start_playback()
+
+    def _start_playback(self):
+        """Start playing back the pathway."""
+        if not self.pathway['waypoints']:
+            self._log("No waypoints to play")
+            return
+
+        self.playback_active = True
+        self.play_btn.config(text="■ Stop", bg=self.colors['accent'])
+        self.playback_label.config(text="▶ PLAYING")
+        self._log("Playback started")
+
+        # Start playback in background thread
+        self.playback_thread = threading.Thread(target=self._playback_loop, daemon=True)
+        self.playback_thread.start()
+
+    def _stop_playback(self):
+        """Stop pathway playback."""
+        self.playback_active = False
+        self.play_btn.config(text="▶ Play", bg=self.colors['success'])
+        self.playback_label.config(text="")
+        self._stop_all_jog()
+        self._log("Playback stopped")
+
+    def _playback_loop(self):
+        """Background thread for pathway playback."""
+        while self.playback_active:
+            for i, waypoint in enumerate(self.pathway['waypoints']):
+                if not self.playback_active:
+                    return
+
+                # Update UI on main thread
+                self.root.after(0, lambda idx=i: self.playback_label.config(
+                    text=f"▶ {idx+1}/{len(self.pathway['waypoints'])}"))
+
+                # Move robot(s) to waypoint
+                self._move_to_waypoint(waypoint)
+
+                # Wait for motion to complete (simplified - uses delay based on speed)
+                # Lower speed = longer delay
+                delay = max(0.5, 3.0 - (self.speed / 50.0))
+                time.sleep(delay)
+
+                if not self.playback_active:
+                    return
+
+            # Check if we should loop
+            if not self.playback_loop:
+                self.root.after(0, self._stop_playback)
+                return
+
+    def _move_to_waypoint(self, waypoint):
+        """Move robot(s) to a waypoint position."""
+        # Scale speed 1-100% to robot range 1-25
+        robot_speed = max(1, int(self.speed * 25 / 100))
+        accel, decel = self._get_accel_decel()
+
+        # Move Robot 1
+        if waypoint.get('r1') and self.robot1.connected:
+            joints = waypoint['r1']['joints']
+            j7 = waypoint['r1'].get('j7', 0.0)
+            # AR4 move joint command format (no spaces)
+            cmd = f"MJA{joints[0]:.3f}B{joints[1]:.3f}C{joints[2]:.3f}"
+            cmd += f"D{joints[3]:.3f}E{joints[4]:.3f}F{joints[5]:.3f}"
+            cmd += f"J{j7:.3f}S{robot_speed}A{accel}D{decel}"
+            self.robot1.send(cmd)
+
+        # Move Robot 2
+        if waypoint.get('r2') and self.robot2.connected:
+            joints = waypoint['r2']['joints']
+            j7 = waypoint['r2'].get('j7', 0.0)
+            cmd = f"MJA{joints[0]:.3f}B{joints[1]:.3f}C{joints[2]:.3f}"
+            cmd += f"D{joints[3]:.3f}E{joints[4]:.3f}F{joints[5]:.3f}"
+            cmd += f"J{j7:.3f}S{robot_speed}A{accel}D{decel}"
+            self.robot2.send(cmd)
+
+        # Move feeder
+        feeder_pos = waypoint.get('feeder', 0.0)
+        if self.feeder.connected and feeder_pos != self.feeder.position:
+            delta = feeder_pos - self.feeder.position
+            if delta > 0:
+                self.feeder.feed(abs(delta))
+            else:
+                self.feeder.retract(abs(delta))
 
     def _update_status(self):
         """Periodic status update with LED indicators."""
